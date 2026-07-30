@@ -1193,6 +1193,22 @@ std::vector<int> NegotiationLegalizer::runAbacus()
       order.push_back(i);
     }
   }
+  // Row-major because Abacus legalizes one row at a time: abacusRow packs a
+  // row left to right against that row's own capacity, and collapseClusters
+  // only ever tests the newest cluster against its immediate predecessor.
+  // Ordering by row, then by site within the row, hands cells to the sweep
+  // in the same sequence the row is packed in, so the row assignment
+  // snapToLegal makes and the packing abacusRow performs agree rather than
+  // disagreeing arbitrarily. The order is load-bearing, not cosmetic: row
+  // assignment is greedy and consumes capacity, so a cell considered
+  // earlier can claim sites a later one wanted; only a traversal fixed by
+  // the design's own geometry makes that outcome reproducible. Fixed cells
+  // are left out because they cannot move and already occupy the capacity
+  // model as obstructions, so ranking them would decide nothing. This is a
+  // positional order over grid indices (rows, then sites), unlike the
+  // default diamond-search engine's structural CellPlaceOrderLess, which
+  // ranks on multi-row, then area, then distance to the core centre in
+  // database units, then instance name (Place.cpp).
   std::ranges::sort(order, [this](int a, int b) {
     if (cells_[a].y != cells_[b].y) {
       return cells_[a].y < cells_[b].y;
@@ -1221,6 +1237,12 @@ std::vector<int> NegotiationLegalizer::runAbacus()
     if (byRow[r].empty()) {
       continue;
     }
+    // Not redundant with the sort above: that one ran before the snap pass,
+    // which rewrites both grid coordinates, so a cell can land in a
+    // different row and at a different site than it was ranked by.
+    // Bucketing kept only insertion order, which is therefore stale in x,
+    // while abacusRow's left-to-right cluster merge assumes ascending
+    // current x. The re-sort restores the invariant snapping broke.
     std::ranges::sort(
         byRow[r], [this](int a, int b) { return cells_[a].x < cells_[b].x; });
     abacusRow(r, byRow[r]);

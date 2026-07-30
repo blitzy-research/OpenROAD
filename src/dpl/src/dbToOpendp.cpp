@@ -241,6 +241,33 @@ Rect Opendp::getBbox(odb::dbInst* inst)
 
   return Rect(loc_x, loc_y, loc_x + width, loc_y + height);
 }
+// Determinism foundation for the whole dpl module.  dbBlock::getInsts()
+// returns instances in OpenDB's internal storage order.  That order is an
+// implementation detail of the database, not a property of the design: it is
+// free to differ between builds, between platforms, and between two
+// databases that describe the same netlist.  Instance names are unique
+// within a block, so ordering on them makes the node sequence - and, since
+// Network::addNode numbers every node with its own index, each node id too -
+// a pure function of the design rather than of how the database happens to
+// be walked.
+//
+// Every later ordering decision in dpl inherits this base order.  place()
+// collects its placement candidates by walking network_->getNodes(), then
+// reorders them with std::ranges::sort under CellPlaceOrderLess (Place.cpp).
+// std::ranges::sort is not stable, so it may permute any cells the
+// comparator reports as equivalent.  Reproducible legalization therefore
+// rests on two facts together: the base order fixed here, and
+// CellPlaceOrderLess being a strict total order - which holds only because
+// its final key is a comparison of the unique instance names.  stable_sort
+// is used here rather than sort for the same defensive reason: unique names
+// cannot tie, but if they ever did the incoming order would still decide.
+//
+// None of this is cosmetic.  OpenROAD is expected to reproduce results
+// bit-for-bit across compilers and operating systems, and in a legalizer the
+// processing order is the result: checkPixels() refuses any site already
+// claimed by an earlier cell, so reordering the cells lands them on
+// different legal sites, with different displacement, and hands different
+// timing to every stage downstream.
 void Opendp::createNetwork()
 {
   odb::dbBlock* block = db_->getChip()->getBlock();
