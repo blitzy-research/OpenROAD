@@ -12,14 +12,25 @@ Open-Source Detailed Placement Engine. Its key features are:
 
 #### Diamond Search
 
-The default engine performs a BFS-style diamond search from each cell's
-global placement position, expanding outward in Manhattan order until a
-legal site is found.
+The default engine performs a best-first search over the site grid,
+starting from each cell's global placement position. The search frontier is
+a priority-queue min-heap ordered on Manhattan distance measured in database
+units, with the horizontal axis scaled by the site width and the vertical
+axis resolved through the row table, so the first legal site the heap pops
+is the nearest legal site under that metric. When no legal site is reachable
+within the displacement limits, the engine escalates to a bounded
+rip-up-and-replace of the cells around the target position.
+
+The detailed documentation of the search, the distance it minimizes, the
+cell ordering and the fallback path can be found
+[here](doc/LegalizationAlgorithm.md).
 
 #### NegotiationLegalizer
 
 An optional two-pass legalizer based on the NBLG paper. Enabled with
 `-use_negotiation` on the `detailed_placement` command.
+
+The figure below traces this optional engine's pass structure, not the default diamond-search path.
 
 ```
 Global Placement result
@@ -47,7 +58,7 @@ Global Placement result
          ▼
 ┌───────────────────┐
 │ Post-optimisation │  Greedy displacement improvement (5 passes).
-│     (Skipped)     │  Cell swap via bipartite matching within groups.
+│     (Skipped)     │  Same-type cell pair swap if displacement drops.
 │                   │  
 └────────┬──────────┘
          │
@@ -226,7 +237,7 @@ Simply run the following script:
 
 ## Limitations
 
-The following limitations apply when using the NegotiationLegalizer (`-use_negotiation`):
+The limitations listed below apply only to the NegotiationLegalizer (`-use_negotiation`), not to the default diamond-search engine:
 
 1. **Abacus cluster chain**: The current Abacus implementation uses a
    simplified cluster structure. A production version should maintain an
@@ -245,6 +256,10 @@ The following limitations apply when using the NegotiationLegalizer (`-use_negot
    VDD/VSS. Replace with actual LEF pg_pin parsing once available in the
    build context.
 
+The default diamond-search engine has its own limitations, described in the
+[Known Gotchas, Determinism, and Limitations](doc/LegalizationAlgorithm.md#known-gotchas-determinism-and-limitations)
+section of the legalization algorithm documentation.
+
 ## FAQs
 
 Check out [GitHub discussion](https://github.com/The-OpenROAD-Project/OpenROAD/discussions/categories/q-a?discussions_q=category%3AQ%26A+opendp+in%3Atitle)
@@ -262,6 +277,7 @@ about this tool.
 2. P. Spindler et al., "Abacus: Fast legalization of standard cell circuits with minimal movement," ISPD 2008.
 3. J. Chen et al., "NBLG: A Robust Legalizer for Mixed-Cell-Height Modern Design," IEEE TCAD, vol. 41, no. 11, 2022.
 4. L. McMurchie and C. Ebeling, "PathFinder: A negotiation-based performance-driven router for FPGAs," 1995.
+5. Local reprint of reference 1, the OpenDP paper this module is based on. [(.pdf)](doc/OpenDP.pdf)
 
 ## License
 
