@@ -1208,7 +1208,7 @@ std::vector<int> NegotiationLegalizer::runAbacus()
   // positional order over grid indices (rows, then sites), unlike the
   // default diamond-search engine's structural CellPlaceOrderLess, which
   // ranks on multi-row, then area, then distance to the core centre in
-  // database units, then instance name (Place.cpp).
+  // database units, then instance name (Place.cpp:L299-L319).
   std::ranges::sort(order, [this](int a, int b) {
     if (cells_[a].y != cells_[b].y) {
       return cells_[a].y < cells_[b].y;
