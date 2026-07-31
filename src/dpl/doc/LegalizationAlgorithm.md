@@ -1,3 +1,8 @@
+---
+myst:
+  heading_anchors: 3
+---
+
 # Detailed Placement Legalization Algorithm
 
 This document explains how the OpenROAD detailed-placement module (`dpl`)
