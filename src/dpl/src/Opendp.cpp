@@ -885,16 +885,22 @@ bool Opendp::checkOverlap(const Rect& cell, const Rect& box)
 }
 
 // Establishes the pixel-level ownership that is one of three mechanisms
-// enforcing fence regions, and the only per-site one. diamondSearch first
-// clips its whole search window to the group's bounding box, so a grouped
-// cell is never offered a candidate outside it. checkRegionOverlap then
-// queries the region R-tree for each candidate, which is what catches a
-// cell straddling two rectangles of one region or intruding on a region it
-// does not belong to. The ownership stamped here is what the per-pixel
-// scan reads: it rejects a grouped cell whose pixel belongs to a different
-// group, and rejects an ungrouped cell on any group-owned pixel. Bounding
-// box and R-tree both work on whole rectangles, so without this stamp
-// nothing would decide legality site by site.
+// enforcing fence regions, and the only one that knows which group a site
+// belongs to. diamondSearch first clips its whole search window to the
+// group's merged bounding box, which for a region assembled from several
+// rectangles encloses whatever lies between them too, so that clamp
+// bounds the search rather than settling legality. checkRegionOverlap
+// then queries the region R-tree for each candidate, and that tree stores
+// bare rectangles with no group attached to them, so what it answers is
+// geometric coverage alone: a cell with a region must be covered by a
+// single region rectangle, which is what rejects one straddling two of
+// them, and a cell with none must overlap no region rectangle at all.
+// Which group a site belongs to is knowable only from the ownership
+// stamped here, and that is what the per-pixel scan reads: it rejects a
+// grouped cell whose pixel belongs to a different group, and rejects an
+// ungrouped cell on any group-owned pixel. Bounding box and R-tree both
+// work on whole rectangles, so without this stamp nothing would decide
+// legality site by site.
 //
 // The pass reuses pixel->util as a coverage accumulator, which is why it
 // begins by zeroing that field everywhere. A rectangle adds one unit to

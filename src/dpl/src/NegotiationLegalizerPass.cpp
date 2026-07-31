@@ -727,23 +727,22 @@ void NegotiationLegalizer::sortByNegotiationOrder(
 
   // Observed characteristic that separates this ordering from the default
   // diamond-search engine's: the comparator below has no unique final key.
-  // Two cells with equal overuse, equal height (in rows) and equal width
-  // (in sites) compare as equivalent, and a standard-cell library
-  // instantiates the same master many times, so such ties are common. The
-  // sort applied here is not stable, so tied cells keep whatever relative
-  // order the standard library happens to produce, which may vary between
-  // runs, between standard library implementations and between platforms.
+  // The chain ends at ascending width, so two cells with equal overuse,
+  // equal height (in rows) and equal width (in sites) compare as
+  // equivalent, and a standard-cell library instantiates the same master
+  // many times, so such ties are common. The sort applied here is not
+  // stable, so tied cells keep whatever relative order the standard
+  // library happens to produce, which may vary between runs, between
+  // standard library implementations and between platforms.
   // CellPlaceOrderLess::operator() in Place.cpp has no such freedom: it
   // ends in an instance-name strcmp and instance names are unique within
   // a block, so that comparator is a strict total order and reproduces
   // even though the std::ranges::sort that applies it is not stable
-  // either. Ascending width carries the reason given above for
-  // ascending height one step further: a narrow cell drops into whatever
-  // gap is left, so settling narrow cells first leaves fewer wide cells
-  // needing a contiguous run of free sites. The primary key is congestion
-  // read from the live grid rather than a static property of the cell, so
-  // this order is rebuilt on every negotiation iteration; the call sites
-  // are at L201 and L298.
+  // either. The primary key is congestion read from the live grid rather
+  // than a static property of the cell, so this order is rebuilt rather
+  // than reused: negotiationIter() sorts at the head of every rip-up and
+  // replace sweep, and sorts again once the history costs are updated
+  // because that sweep left overflow behind.
   std::ranges::sort(indices, [&](int a, int b) {
     const int oa = cellOveruse(a);
     const int ob = cellOveruse(b);

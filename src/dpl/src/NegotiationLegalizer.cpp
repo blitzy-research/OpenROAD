@@ -1196,19 +1196,24 @@ std::vector<int> NegotiationLegalizer::runAbacus()
   // Row-major because Abacus legalizes one row at a time: abacusRow packs a
   // row left to right against that row's own capacity, and collapseClusters
   // only ever tests the newest cluster against its immediate predecessor.
-  // Ordering by row, then by site within the row, hands cells to the sweep
-  // in the same sequence the row is packed in, so the buckets built below
-  // start out close to the ascending-x sequence abacusRow needs.
+  // Ranking by row, then by site within the row, therefore walks the cells
+  // in the same shape the sweep will later work in, and it derives that
+  // walk from the design's own geometry rather than from cell storage
+  // order.
   //
-  // The snap pass this feeds does not itself race for sites: all movable
-  // usage is stripped just below before any cell is snapped, and snapToLegal
-  // is const and the only occupancy it consults is the static per-site
-  // capacity - never the usage that would let it see an earlier cell's claim
-  // - so one cell's row choice never denies a site to a later one, and the
-  // row and site it returns for a cell are the same whenever that cell is
-  // considered.  What the ordering settles is the input the Abacus sweep
-  // sees - which cells reach a bucket and in what sequence - and it settles
-  // it from the design's own geometry rather than from cell storage order.
+  // What this order does not decide is where any cell lands.  All movable
+  // usage is stripped just below before the first cell is snapped, and
+  // snapToLegal is const: the only occupancy it consults is the static
+  // per-site capacity, alongside the row and fence tests - never the usage
+  // that would let it see an earlier cell's claim.  Each snap is therefore
+  // independent of every other, the row and site it returns for a cell are
+  // the same whenever that cell is considered, and which bucket a cell
+  // joins follows from its own snapped row alone.  What this order does
+  // settle is the sequence of those independent snap calls, the insertion
+  // order inside each bucket, and the order of the still-illegal list
+  // returned at the end.  The sequence the Abacus sweep itself consumes is
+  // established later, by the per-row sort on current x immediately before
+  // each abacusRow call, because snapping leaves the insertion order stale.
   //
   // Observed characteristic: the comparison below is on position alone and
   // stops there, with no further key. Two movable cells that start on the
