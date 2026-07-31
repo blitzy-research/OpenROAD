@@ -173,7 +173,11 @@ def setup(app):
         shutil.copy("main/README.md", "main/README2.md")
 
     # these prefix swaps will be reverted and is needed for sphinx compilation.
-    for filename in ["../README.md", "../README2.md"]:
+    for filename in [
+        "../README.md",
+        "../README2.md",
+        "../src/dpl/doc/LegalizationAlgorithm.md",
+    ]:
         swap_prefix(filename, "(docs/", "(../")
         swap_prefix(filename, "```mermaid", "```{mermaid}\n:align: center\n")
 
