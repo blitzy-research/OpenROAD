@@ -2136,8 +2136,13 @@ For the algorithms behind this engine, see references 2, 3 and 4 in
 ## Function Reference Index
 
 **TABLE 5.** Every routine named anywhere in this document, mapped to its
-definition line at pin `4bc0d66972`. Resolve any entry with
-`git show 4bc0d66972:<path>`.
+definition line at pin `4bc0d66972`. The first four sub-sections take the four
+files that contribute the most entries and list those entries by line;
+**Other files** holds the landmark ordering and optional-engine sites;
+**Routines named in supporting files** holds everything else the path reaches;
+and **Key type declarations** holds the types. Where a name is overloaded, each
+overload has its own row, distinguished in the definition column. Resolve any
+entry with `git show 4bc0d66972:<path>`.
 
 ### `src/dpl/src/Place.cpp`
 
@@ -2177,6 +2182,7 @@ definition line at pin `4bc0d66972`. Resolve any entry with
 | L935 | `Opendp::calcDist` |
 | L942 | `Opendp::canBePlaced` |
 | L967 | `Opendp::checkRegionOverlap` |
+| L986 | `queryBox` — not a routine but the local `bgBox` the region R-tree is queried with, inside `checkRegionOverlap` |
 | L1009 | `Opendp::checkPixels` |
 | L1103 | `Opendp::checkRowPowerCompatible` |
 | L1113 | `Opendp::checkMasterSym` |
@@ -2292,6 +2298,69 @@ definition line at pin `4bc0d66972`. Resolve any entry with
 | `src/dpl/src/NegotiationLegalizer.cpp:L1186` | `NegotiationLegalizer::runAbacus` |
 | `src/dpl/src/NegotiationLegalizerPass.cpp:L710` | `NegotiationLegalizer::sortByNegotiationOrder` |
 | `src/dpl/src/NegotiationLegalizerPass.cpp:L820` | `NegotiationLegalizer::cellSwap` |
+
+### Routines named in supporting files
+
+The remaining routines this document names — accessors, interfaces and
+optional-engine helpers the legalization path reaches. None is defined in the
+four files tabulated by line above; where a file also appears under **Other
+files**, that sub-section records a landmark ordering and this one records the
+routines. Ordered by file, then by line.
+
+| Location | Definition |
+|---|---|
+| `src/dpl/src/infrastructure/Objects.cpp:L104` | `Node::getLeft` |
+| `src/dpl/src/infrastructure/Objects.cpp:L108` | `Node::getBottom` |
+| `src/dpl/src/infrastructure/Objects.cpp:L124` | `Node::getHeight` |
+| `src/dpl/src/infrastructure/Objects.cpp:L154` | `Node::isFixed` |
+| `src/dpl/src/infrastructure/Objects.cpp:L243` | `Node::getGroup` |
+| `src/dpl/src/infrastructure/Objects.cpp:L247` | `Node::getRegion` |
+| `src/dpl/src/infrastructure/Objects.cpp:L251` | `Node::getMaster` |
+| `src/dpl/src/infrastructure/Objects.cpp:L255` | `Node::inGroup` |
+| `src/dpl/src/infrastructure/Objects.cpp:L296` | `Node::setLeft` |
+| `src/dpl/src/infrastructure/Objects.cpp:L300` | `Node::setBottom` |
+| `src/dpl/src/infrastructure/Objects.cpp:L487` | `Group::getCells` |
+| `src/dpl/src/infrastructure/Objects.cpp:L491` | `Group::getBBox` |
+| `src/dpl/src/infrastructure/Padding.cpp:L93` | `Padding::padLeft` (cell overload) |
+| `src/dpl/src/infrastructure/Padding.cpp:L98` | `Padding::padLeft` (instance overload) |
+| `src/dpl/src/infrastructure/Padding.cpp:L114` | `Padding::padRight` (cell overload) |
+| `src/dpl/src/infrastructure/Padding.cpp:L119` | `Padding::padRight` (instance overload) |
+| `src/dpl/src/infrastructure/Padding.cpp:L135` | `Padding::paddedWidth` |
+| `src/dpl/src/infrastructure/architecture.h:L36` | `Architecture::getRegions` |
+| `src/dpl/src/infrastructure/architecture.cxx:L222` | `Architecture::find_closest_row` |
+| `src/dpl/src/infrastructure/architecture.cxx:L246` | `Architecture::powerCompatible` |
+| `src/dpl/src/infrastructure/network.h:L35` | `Network::getNodes` |
+| `src/dpl/src/infrastructure/Grid.h:L142` | `Grid::getRowSiteCount` |
+| `src/dpl/src/infrastructure/Grid.h:L143` | `Grid::getSiteWidth` |
+| `src/dpl/src/infrastructure/Coordinates.h:L152` | `GridRect::closestPtInside` (declared at `L143`) |
+| `src/dpl/src/infrastructure/Coordinates.h:L205` | `dbuToGridCeil` (X overload) |
+| `src/dpl/src/infrastructure/Coordinates.h:L210` | `dbuToGridFloor` (X overload) |
+| `src/dpl/src/infrastructure/Coordinates.h:L215` | `dbuToGridCeil` (Y overload) |
+| `src/dpl/src/infrastructure/Coordinates.h:L220` | `dbuToGridFloor` (Y overload) |
+| `src/dpl/src/PlacementDRC.cpp:L69` | `PlacementDRC::checkEdgeSpacing` (cell overload) |
+| `src/dpl/src/PlacementDRC.cpp:L77` | `PlacementDRC::checkEdgeSpacing` (position and orientation overload) |
+| `src/dpl/src/PlacementDRC.cpp:L162` | `PlacementDRC::checkBlockedLayers` (cell overload) |
+| `src/dpl/src/PlacementDRC.cpp:L167` | `PlacementDRC::checkBlockedLayers` (position overload) |
+| `src/dpl/src/PlacementDRC.cpp:L186` | `PlacementDRC::checkDRC` (cell overload) |
+| `src/dpl/src/PlacementDRC.cpp:L192` | `PlacementDRC::checkDRC` (position and orientation overload — the one stage 7 calls) |
+| `src/dpl/src/PlacementDRC.cpp:L334` | `PlacementDRC::checkPadding` (cell overload) |
+| `src/dpl/src/PlacementDRC.cpp:L356` | `PlacementDRC::checkPadding` (position overload) |
+| `src/dpl/src/graphics/DplObserver.h:L35` | `DplObserver::startPlacement` |
+| `src/dpl/src/graphics/DplObserver.h:L36` | `DplObserver::drawSelected` |
+| `src/dpl/src/graphics/DplObserver.h:L37` | `DplObserver::binSearch` |
+| `src/dpl/src/graphics/DplObserver.h:L43` | `DplObserver::redrawAndPause` |
+| `src/dpl/src/dbToOpendp.cpp:L171` | `Opendp::importDb` |
+| `src/dpl/src/dbToOpendp.cpp:L483` | `Opendp::adjustNodesOrient` |
+| `src/dpl/src/optimization/detailed_orient.cxx:L503` | `DetailedOrient::getMasterSymmetry` |
+| `src/dpl/src/NegotiationLegalizer.h:L151` | `NegotiationLegalizer::setRunAbacus` |
+| `src/dpl/src/NegotiationLegalizer.h:L219` | `NegotiationLegalizer::gridAt` (mutable overload) |
+| `src/dpl/src/NegotiationLegalizer.h:L223` | `NegotiationLegalizer::gridAt` (const overload) |
+| `src/dpl/src/NegotiationLegalizer.cpp:L88` | `NegotiationLegalizer::legalize` |
+| `src/dpl/src/NegotiationLegalizer.cpp:L465` | `NegotiationLegalizer::setDplPositions` |
+| `src/dpl/src/NegotiationLegalizer.cpp:L1126` | `NegotiationLegalizer::snapToLegal` |
+| `src/dpl/src/NegotiationLegalizer.cpp:L1248` | `NegotiationLegalizer::abacusRow` |
+| `src/dpl/src/NegotiationLegalizerPass.cpp:L746` | `NegotiationLegalizer::greedyImprove` |
+| `src/utl/include/utl/Logger.h:L384` | `debugPrint` — the logging macro, and the one entry here from outside `dpl` |
 
 ### Key type declarations
 
