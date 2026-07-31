@@ -72,6 +72,9 @@ entries:
     title: Clock gating
   - file: main/src/dpl/README
     title: Detailed Placement
+    entries:
+    - file: main/src/dpl/doc/LegalizationAlgorithm
+      title: Legalization Algorithm
   - file: main/src/cts/README
     title: Clock Tree Synthesis
   - file: main/src/grt/README
