@@ -72,15 +72,22 @@ void Grid::visitDbRows(odb::dbBlock* block,
 // Pixel storage is dimensioned from the row tables that examineRows()
 // derived, not from the core rectangle, because with rows of differing
 // heights the number of rows is not the core height divided by anything.
-// The allocation is deliberately idempotent while the reset below is not:
-// the grid is rebuilt for every legalization, filler and check pass in a
-// session, so the vectors are reused but every pixel starts from a known
-// state.  Validity is cleared here and opted back in one site at a time by
-// the row walk in markHopeless(), which is what lets a design whose rows
-// are fragmented leave the gaps between fragments unusable instead of
-// assuming every column of every row exists.  The per-row site maps are
-// emptied and resized in the same breath so no later lookup indexes a row
-// that was never created.
+// The vectors are sized once and reused: the resize runs only while the grid
+// is still empty, whereas the loop below runs on every pass, so repeated
+// legalization, filler and check passes share one allocation.  That loop is
+// a partial reset, and which fields it covers matters.  It covers six -- the
+// occupying cell, the owning fence group, the utilization accumulator, the
+// validity flag, the hopeless flag and the blocked-layer mask -- and it
+// clears nothing else, so a reused grid carries a padding reservation an
+// earlier pass made and the negotiation engine's capacity, usage and history
+// cost forward untouched.  What this establishes is therefore a clean slate
+// for the diamond legalizer's own view of a pixel rather than for the whole
+// pixel.  Validity is among the six, cleared here and opted back in one site
+// at a time by the row walk in markHopeless(), which is what lets a design
+// whose rows are fragmented leave the gaps between fragments unusable
+// instead of assuming every column of every row exists.  The per-row site
+// maps are emptied and resized in the same breath so no later lookup indexes
+// a row that was never created.
 void Grid::allocateGrid()
 {
   // Make pixel grid
@@ -107,23 +114,29 @@ void Grid::allocateGrid()
   row_sites_.resize(row_count_.v);
 }
 
-// Precomputes the start points from which the site search cannot succeed,
-// so that a doomed search is never run cell by cell.  The grid begins
-// wholly hopeless and each database row subtracts the window reachable
-// from it within the caller's displacement limits; whatever no row ever
-// subtracts is unreachable from every row and is flagged so the placer
-// diverts through moveHopeless() rather than searching from there.
-// Working by subtraction is what makes fragmented and staggered rows fall
-// out for free, since no row has to know about any other.
+// Screens start points, so that a search unlikely to succeed is not run
+// cell by cell.  The grid begins wholly flagged and each database row
+// subtracts a window around itself sized by the caller's displacement
+// limits; whatever no row ever subtracts stays flagged, and the placer
+// diverts an origin landing there through moveHopeless() instead of
+// searching from it.  Working by subtraction is what makes fragmented and
+// staggered rows fall out for free, since no row has to know about any
+// other.
 //
-// The margin applied to those bounds is added on the low side and taken
-// off the high side, so it pulls the reachable window inward and classes
-// slightly more of the grid as hopeless than the limits alone would.  That
+// The flag is that conservative classification and not an exact statement
+// of unreachability.  The margin applied to those bounds is added on the
+// low side and taken off the high side, so it pulls each subtracted window
+// inward and leaves flagged a rim of start points from which a legal site
+// would in fact still have been within the displacement limits.  That
 // direction is deliberate, for the reason recorded in the comment beside
 // the constant below.  Its units follow the limits it adjusts, which the
 // DPL 5 message states as sites horizontally and rows vertically, so the
 // two axes are not interchangeable even though the arithmetic reads
 // symmetrically.
+//
+// The flag is read only where an origin is chosen, by legalPt() and
+// moveHopeless() in Place.cpp.  Neither diamondSearch() nor checkPixels()
+// looks at it, so it never rules a candidate site out.
 void Grid::markHopeless(odb::dbBlock* block,
                         const int max_displacement_x,
                         const int max_displacement_y)
@@ -174,14 +187,23 @@ void Grid::markHopeless(odb::dbBlock* block,
 }
 
 // Two obstruction sources are painted differently, and the contrast is the
-// point.  A hard blockage invalidates the pixel outright: no master may
-// occupy it, so there is nothing left to qualify.  A special-net wire
-// instead sets one bit per routing level, because whether that wire really
-// obstructs depends on which layers the candidate master uses -- the same
-// pixel can be legal for one master and illegal for another.  The bitmask
-// is indexed by routing level and is read later by the design-rule stage
-// of the placement predicate, which tests it against the master's own
-// used-layer mask instead of treating the pixel as dead.
+// point.  A hard blockage clears the pixel's validity, and the placement
+// predicate turns an invalid pixel down outright without asking anything
+// about the candidate master.  A special-net wire instead sets one bit per
+// routing level, because whether that wire really obstructs depends on
+// which layers the candidate master uses -- the same pixel can be legal
+// for one master and illegal for another.  The bitmask is indexed by
+// routing level and is read later by the design-rule stage of the
+// placement predicate, which tests it against the master's own used-layer
+// mask instead of treating the pixel as dead.
+//
+// Neither mark is the last word, and the blockage one in particular is not
+// a promise about the rest of the pass.  Validity is one flag with several
+// writers, and fence-region initialization in Opendp.cpp runs after this
+// and sets it again for every pixel a region's rectangles cover
+// completely, so a pixel retired here can be handed back as usable inside
+// a region.  What this stage establishes is the state the grid starts
+// from, not an invariant that survives to the search.
 //
 // The wire filter is correspondingly narrow: routing layers only, only the
 // two levels named in the comment beside that test, and only wires running
@@ -264,16 +286,28 @@ void Grid::markBlocked(odb::dbBlock* block)
   }
 }
 
-// A sequencer whose order is forced.  Padding must be owned before the row
-// walk that consults it, pixels must exist before anything paints them,
-// and site validity must be established before reachability can be
-// derived from it -- so allocation precedes the hopeless marking, which
-// precedes obstruction painting.  The row tables the allocation reads are
-// not built here: examineRows() runs once during database import, well
-// ahead of this, which is why a routine that reallocates the grid on every
-// pass can rely on them already existing.  Nothing may query the grid
-// between these steps, because a search answered against a half-built grid
-// could return a site that a fixed obstruction already owns.
+// A sequencer whose order is forced, and each step is placed by what the
+// next one writes rather than by what it reads.  The padding object is
+// taken over first for a reason of its own: none of the three steps below
+// reads it, but the grid holds it from here on for every later query that
+// needs a padded footprint -- the padded width and end column, the padded
+// sweep in visitCellPixels() and the reservation painting -- none of which
+// is handed a padding object of its own.  Allocation comes next because
+// both marking passes write pixels directly and cannot run against empty
+// storage -- and it reuses the vectors it already holds, resizing only
+// while they are still empty, so this is a per-pass reset rather than a
+// reallocation.  Obstruction painting comes last because the row walk
+// inside the hopeless marking turns validity on for every site of every
+// row it visits: running it after a blockage had cleared a pixel would
+// quietly undo the blockage.
+//
+// The row tables the allocation is dimensioned from are not built here:
+// examineRows() runs once during database import, well ahead of this,
+// which is why a routine called before every pass can rely on them already
+// existing.  Nothing may query the grid between these steps: obstructions
+// are painted last, so a site handed out before that step is one whose
+// blockage is still unpainted and which the completed grid would have
+// refused.
 void Grid::initGrid(odb::dbDatabase* db,
                     odb::dbBlock* block,
                     std::shared_ptr<Padding> padding,
@@ -352,9 +386,22 @@ Pixel* Grid::gridPixel(GridX grid_x, GridY grid_y) const
 }
 
 // Takes a visitor instead of returning a container because the callers do
-// unrelated things per pixel -- paint, erase, count, test -- and this sits
-// on the innermost path of the site search, where building a vector per
-// call would add an allocation to every candidate examined.
+// unrelated things per pixel and none of them wants a copy.
+// setFixedGridCells() claims footprint pixels for cells the legalizer may
+// not move while recording the pad columns as a reservation instead;
+// setInitialGridCells() reads them to find incremental-mode conflicts and
+// then claims them; checkOverlap() uses them to name the cell an illegal
+// cell is sitting on; and setGridCells(), shared by the filler and decap
+// passes, repaints occupancy before either inserts anything.  Each of those
+// runs once per cell over every design cell, so building a vector per call
+// would add an allocation per cell for no gain, and a returned container
+// would also drop the per-pixel flag described below, which the first of
+// those callers switches on.
+//
+// This is not the candidate-testing path.  The placement predicate in
+// checkPixels() sweeps its own nested loops over the footprint it is
+// considering, so the cost of this traversal is paid once per cell painted
+// or verified, never once per candidate site examined.
 //
 // One traversal serves both footprint and padding semantics.  When padding
 // is asked for, the sweep widens by the cell's left and right pad and the
@@ -499,9 +546,12 @@ void Grid::paintPixel(Node* cell)
 // tests are the entire reason a cell can be lifted out of a crowded
 // neighbourhood without corrupting the cells around it, and that in turn
 // is what makes the bounded rip-up path viable -- it evicts a handful of
-// neighbours speculatively, retries, and relies on the grid being exactly
-// as it was for every cell it did not touch.  The journal's move and
-// unplace records pair with this to make the eviction reversible.
+// neighbours, retries the cell that failed, and relies on the grid being
+// exactly as it was for every cell it did not touch.  There is no undo
+// behind that: repainting an evicted cell is a fresh paintPixel() at
+// whatever site its own search found rather than a replay of where it used
+// to be, and a neighbour that cannot be seated again is counted as a
+// placement failure instead of being restored.
 void Grid::erasePixel(Node* cell)
 {
   const auto grid_rect = gridCoveringPadded(cell);
@@ -739,13 +789,13 @@ GridY Grid::gridSnapDownY(DbuY y) const
 }
 
 // Round: the nearest row origin, which is a different answer from the
-// floor above whenever a coordinate sits in the upper part of a row.  For
-// callers whose coordinate is an aspiration to be snapped rather than a
-// position to be classified, so a cell asking for a site is not dragged
-// systematically downward by up to a row.  An exact tie goes to the upper
-// row, which keeps the outcome fixed rather than resting on the sign
-// convention of the difference.  Takes database units, returns a row
-// index.
+// floor above whenever a coordinate sits in the upper part of a row.  It
+// exists because some callers hold a coordinate that is a request to be
+// snapped rather than a position to be classified, and rounding keeps such
+// a request from being dragged systematically downward by up to a row.  An
+// exact tie goes to the upper row, which keeps the outcome fixed rather
+// than resting on the sign convention of the difference.  Takes database
+// units, returns a row index.
 GridY Grid::gridRoundY(DbuY y) const
 {
   const auto grid_y = gridSnapDownY(y);
@@ -759,15 +809,22 @@ GridY Grid::gridRoundY(DbuY y) const
   return grid_y;
 }
 
-// Exclusive end: the first row index at or past the coordinate, meant as a
-// loop bound rather than as a row to occupy.  A coordinate beyond the last
-// recorded boundary yields one past the last row index, and that value is
-// deliberately accepted by the reverse conversion below, which maps it to
-// the top of the core -- so bracketing a span never needs a special case
-// at the top of the grid.  A floor, a round and an exclusive end are three
-// different answers for one coordinate, and substituting either for
-// another is an off-by-one waiting to happen, which is why all three exist
-// side by side.  Takes database units, returns a row index.
+// Exclusive end: the index of the first recorded boundary at or past the
+// coordinate, meant as a loop bound rather than as a row to occupy.  Three
+// kinds of answer come back and they are worth keeping apart.  A coordinate
+// inside the stack of rows yields an index some row also carries, anywhere
+// from zero up to one below the row count.  A coordinate at the top edge of
+// the topmost row yields the index equal to the row count itself: that
+// entry is the top boundary of the grid rather than a row anything can
+// occupy, which is exactly what an exclusive bound wants.  A coordinate
+// past every recorded boundary yields one index further still, one past the
+// end of the boundary table, and that value is deliberately accepted by the
+// reverse conversion below, which maps it to the top of the core -- so
+// bracketing a span never needs a special case at the top of the grid.
+// A floor, a round and an exclusive end are three different answers for one
+// coordinate, and substituting either for another is an off-by-one waiting
+// to happen, which is why all three exist side by side.  Takes database
+// units, returns an index into the row boundary table.
 GridY Grid::gridEndY(DbuY y) const
 {
   auto it = std::lower_bound(  // NOLINT(modernize-use-ranges)
@@ -803,12 +860,17 @@ GridY Grid::gridRoundY(const Node* cell) const
 // The forward conversions meet the same wall, which is why several row
 // tables exist at all.
 //
-// One index past the last row is accepted on purpose and resolves to the
-// top of the core.  That is exactly the value the exclusive end conversion
-// above produces for a coordinate past the last boundary, so the two
-// compose when bracketing a cell's row span without a bounds special case.
-// Every other index is fetched checked, so a genuinely out-of-range row
-// raises instead of reading whatever lies next to the table.
+// One index past the end of the boundary table is accepted on purpose and
+// resolves to the top of the core.  That index sits two above the highest
+// row anything can occupy, because the table holds one entry more than
+// there are rows: the entry at the row count is the grid's top boundary and
+// is fetched from the table like any other, while the extra index above it
+// belongs to no entry and exists only because the exclusive end conversion
+// above produces it for a coordinate past every recorded boundary.
+// Accepting it is what lets the two compose when bracketing a cell's row
+// span without a bounds special case.  Every index the table does hold is
+// fetched checked, so a genuinely out-of-range row raises instead of
+// reading whatever lies next to it.
 //
 // This function is the vertical axis of calcDist(), the priority key of
 // the site search -- not to be confused with centerDist(), which orders
@@ -871,20 +933,34 @@ bool Grid::cellFitsInCore(Node* cell) const
 
 // Runs once during database import, ahead of any grid allocation, because
 // everything downstream is expressed in the row indices it establishes
-// here.  Each row contributes both its lower and its upper edge to the
-// ordered boundary set, which is why that set holds one entry more than
-// there are rows, why the extra entry can be handed back as the top of the
-// core, and why the row count is taken as one less than its size.
+// here.  Each row contributes both its lower and its upper edge to an
+// ordered set keyed on the coordinate, and the edge two stacked rows share
+// coalesces, which is why that set holds one entry more than there are grid
+// rows and why the row count is taken as one less than its size.  The
+// grid's rows are the intervals between consecutive boundaries, so a
+// vertical gap between two bands of rows becomes a grid row in its own
+// right, one whose sites the row walk never validates.  The set's highest
+// entry is the upper edge of the topmost row, a real boundary fetched like
+// any other rather than a row anything can occupy; an index one further up
+// still, past the set entirely, is the value the reverse conversion
+// resolves to the top of the core.
 //
 // Two invariants are settled here.  A single site width across the design
 // is enforced with a hard DPL 51 error, and that is precisely the
 // assumption that lets the horizontal axis be a multiplication while the
-// vertical axis needs a lookup.  The uniform row height is then derived
-// and left unset unless every pair of site heights divides evenly, by the
-// test the comments below describe -- so the hybrid case is settled here,
-// and every conversion that cannot assume a constant row pitch rests on
-// that determination.  A design with no usable rows at all is a DPL 12
-// error, since there is nowhere to put anything.
+// vertical axis needs a lookup.  The uniform row height is then derived by
+// the running test below rather than by comparing every pair of heights: a
+// single candidate is carried forward, each row is checked against that
+// candidate alone, and the candidate becomes the smaller of the two
+// whenever the larger is a multiple of the smaller.  Heights of two, four
+// and six all pass that way, on a surviving candidate of two, even though
+// six is no multiple of four -- what the value asserts is that it divides
+// the heights as they were visited, not that they share a pitch.  The
+// first row to fail the test clears the value and stops the walk, and
+// leaving it unset is what forces every vertical conversion onto the
+// tables; the hybrid-row flag beside it is read straight off the sites and
+// is not derived from this test at all.  A design with no usable rows of
+// either kind is a DPL 12 error, since there is nowhere to put anything.
 void Grid::examineRows(odb::dbBlock* block)
 {
   block_ = block;

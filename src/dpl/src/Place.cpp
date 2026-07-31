@@ -65,8 +65,9 @@ std::string Opendp::printBgBox(
 // pixel as free and will happily hand it out.  Fixed cells go down first,
 // then already-legalized cells when running incrementally, then
 // fence-region ownership.  Only then may cells be searched for, and
-// grouped cells go before the general pass because their legal area is a
-// strict subset of the core.
+// grouped cells go before the general pass because each of them is
+// confined to its own fence region while an ungrouped cell may take any
+// site the region rectangles leave free.
 void Opendp::diamondDPL()
 {
   if (debug_observer_) {
@@ -128,14 +129,23 @@ void Opendp::placeGroups()
   }
 }
 
-// An ungrouped cell whose global-placement position lands on top of a
-// fence region is a conflict the general pass cannot resolve cheaply:
-// checkPixels() rejects every region-owned pixel for a cell that belongs
-// to no region, so the search would have to walk clear of the region
-// before finding anything legal, and the displacement limits may not
-// reach that far.  Seeding such cells at the region edge up front, and
-// marking the ones that succeed held so later passes leave them alone,
-// keeps that walk out of the main pass.
+// An ungrouped cell straddling the left edge of a fence region is a
+// conflict the general pass cannot resolve cheaply: checkPixels() rejects
+// every region-owned pixel for a cell that belongs to no region, so the
+// search would have to walk clear of the region before finding anything
+// legal, and the displacement limits may not reach that far.  Seeding such
+// cells at the region edge up front, and marking the ones that succeed
+// held so later passes leave them alone, keeps that walk out of the main
+// pass.
+//
+// Only that one straddling case is picked up here.  The predicate below
+// asks two things of the cell's unpadded pre-legalization box:
+// horizontally, that it start to the left of the rectangle's left edge and
+// extend past it; vertically, only that it overlap the rectangle at all.
+// The horizontal half is what narrows the pass -- a cell wholly inside a
+// rectangle, or overlapping only its right-hand part, fails it however
+// badly the region and the cell collide, and is left to the general pass
+// and to the recovery path.
 void Opendp::prePlace()
 {
   for (auto& cell : network_->getNodes()) {
@@ -326,8 +336,16 @@ CellPlaceOrderLess::CellPlaceOrderLess(const odb::Rect& core,
 // width and resolves Y through the row table because it has to rank
 // candidate sites physically; this measure only has to rank cells against
 // each other, so an unweighted offset from the core centre is enough.
-// Measuring the cell's lower-left corner rather than its centre means a
-// wide cell scores slightly nearer the centre than it really sits.
+//
+// What it measures is the cell's lower-left corner and not the cell's own
+// centre, so the value differs from a true centre offset by half the cell's
+// width and half its height.  The sign of that shift depends on where the
+// cell lies rather than on how wide it is: a cell to the right of or above
+// the core centre scores nearer than a measurement from its own centre
+// would give, while one to the left of or below the centre scores farther.
+// The difference is bounded by half the cell's own footprint, and this is
+// only the third of the four keys below, so it reorders nothing the
+// row-span and area keys have already separated.
 int CellPlaceOrderLess::centerDist(const Node* cell) const
 {
   return sumXY(abs(cell->getLeft() - center_x_),
@@ -335,10 +353,12 @@ int CellPlaceOrderLess::centerDist(const Node* cell) const
 }
 
 // Four keys, ordered by how badly a cell needs an uncontended grid.
-// Multi-row cells first: power-rail parity has to hold across their whole
-// span, so their legal rows are a subset of every other cell's, and only
-// an unfragmented grid still offers them a site near where global
-// placement wanted them.  Then larger area first, the same argument
+// Multi-row cells first: a candidate site has to offer them a run of free
+// rows rather than one, and checkRowPowerCompatible() has to find matching
+// rail polarity across that whole span, so they generally have fewer sites
+// to choose from than a single-row cell does and only an unfragmented grid
+// still offers them one near where global placement wanted them.  Then
+// larger area first, the same argument
 // expressed by size, since a wide cell needs a long run of consecutive
 // free sites and such runs only exist early.  Then nearer the core centre
 // first, because the interior is the most contended region and claiming
@@ -442,10 +462,14 @@ void Opendp::place()
   // std::ranges::sort is not a stable sort, so equal-comparing elements may
   // be permuted arbitrarily.  Reproducibility here rests entirely on
   // CellPlaceOrderLess ending in a strcmp of the instance name, which is
-  // unique and therefore leaves no equal-comparing pairs at all.  That in
-  // turn rests on createNetwork() having built network_ with a name-ordered
-  // stable_sort, so the order this vector starts in does not depend on
-  // database iteration order either.
+  // unique and therefore leaves no equal-comparing pairs at all.  With no
+  // ties to break, the comparator is a strict total order and the sorted
+  // sequence is a pure function of which cells are in the vector, not of
+  // the order they were collected in -- so the sort result here does not
+  // depend on how network_ was built.  The name-ordered stable_sort in
+  // createNetwork() earns its keep elsewhere: it fixes node insertion
+  // order and node ids, and with them every traversal of getNodes() that
+  // is consumed without being re-sorted.
   std::ranges::sort(sorted_cells, CellPlaceOrderLess(core_, this));
 
   int count = 0;
@@ -777,12 +801,19 @@ void Opendp::deepIterativePause(const std::string& message, bool only_print)
 // and below the target and, horizontally, four times the target's padded
 // width in sites to either side, that factor being derived from the row
 // margin so the two extents stay coupled rather than independently tuned.
-// Eviction never crosses a fence-region boundary, since a cell moved out
-// of its own region could not be legal anywhere.  Note that the collection
-// is a std::set of pointers, so eviction and re-placement order follows
-// heap addresses and may differ between runs; the note above its call
-// site in place() already records this.  A neighbour that cannot be put
-// back fails the call just as the target cell does.
+// Eviction is filtered on fence-region membership as a boolean, not on
+// region identity: the test asks only whether target and neighbour are
+// both in some region or both in none, so a grouped target may well evict
+// a cell belonging to a different region, while a grouped and an ungrouped
+// cell never disturb each other.  Nothing is lost by that, because each
+// evicted cell is re-placed by its own diamondMove(), whose window is
+// clipped to that cell's own region and whose legality predicate confines
+// it there as well, so a neighbour pulled out of a different region is
+// still put back inside that region.  Note that the collection is a
+// std::set of pointers, so eviction and re-placement order follows heap
+// addresses and may differ between runs; the note above its call site in
+// place() already records this.  A neighbour that cannot be put back fails
+// the call just as the target cell does.
 bool Opendp::ripUpAndReplace(Node* target_cell)
 {
   const GridPt taget_cell_pixel = legalGridPt(target_cell, true);
@@ -858,13 +889,24 @@ bool Opendp::ripUpAndReplace(Node* target_cell)
 }
 
 // Swapping is the one move that needs no free space, which is why the
-// refinement passes fall back on it.  It is only sound between cells of
-// identical width and height: each simply inherits the other's committed
-// footprint, so no pixel outside those two footprints is touched and no
-// legality question beyond the design rules can arise.  Held and fixed
-// cells are excluded because their positions were decided deliberately.
-// The exchange is journalled and undone if the design-rule check fails,
-// because by that point both cells have already been moved.
+// random-swap pass over a fence region's cells is built on it.  The
+// identical width and height requirement is what keeps it cheap: each cell
+// inherits the other's committed footprint exactly, so no pixel outside
+// those two footprints is written and neither cell can come to overlap
+// anything a search would otherwise have had to find room around.
+//
+// Preserving the footprints is not the same as preserving legality, and the
+// re-check here is narrower than the one a search runs.  What is rerun is
+// the design-rule engine for both cells, which covers four things: edge
+// spacing, padding, blocked layers and the one-site gap.  Site
+// availability, fence-region containment, master symmetry against the site
+// orientation and power-rail parity across the span of a multi-row cell all
+// go unrepeated; they are carried over from the two footprints being
+// interchangeable rather than re-established.  Held and fixed cells are
+// excluded because their positions were decided deliberately.  The exchange
+// is recorded in a journal local to this call and undone when the
+// design-rule check fails, because by that point both cells have already
+// been moved.
 bool Opendp::swapCells(Node* cell1, Node* cell2)
 {
   if (cell1 != cell2 && !cell1->isHold() && !cell2->isHold()
@@ -1139,8 +1181,9 @@ bool Opendp::canBePlaced(const Node* cell, GridX bin_x, GridY bin_y) const
 // region rectangle, the placement is legal only when the cell's own box is
 // covered by that rectangle: containment runs cell inside region, not the
 // other way round.  If the cell belongs to a region and the overlap count
-// is zero or greater than one it is illegal, because part of the cell
-// would then lie outside any single region rectangle.  If the cell belongs
+// is zero or greater than one it is illegal: the implementation admits only
+// a single-rectangle answer, so anything else is treated as unresolved
+// rather than examined further.  If the cell belongs
 // to no region it is legal only when it overlaps no region rectangle at
 // all, since an unconstrained cell may not intrude on a fence region.
 // That last case is the one the final return below reaches; the comment
@@ -1198,10 +1241,16 @@ bool Opendp::checkRegionOverlap(const Node* cell,
 // Four, the optional one-site-gap probe.  Five, master symmetry.  Six,
 // power-rail parity for multi-row cells.  Seven, the design rules.
 // Orientation is a legality question here, not a cosmetic one: the supply
-// rails run along a cell's top and bottom edges, so consecutive rows admit
-// opposite orientations and a cell landed with the wrong parity would meet
-// the wrong rails.  That is why the site orientation is queried inside the
-// placement predicate instead of being fixed up afterwards.
+// rails run along a cell's top and bottom edges, so which rails a cell
+// meets follows from the orientation of the row it lands in, and a cell
+// landed against the wrong rails is an electrical error rather than an
+// untidy one.  That orientation is a property of the individual row: the
+// grid records whatever orientation each database row declared, alongside
+// the span of sites it declared it for, and this stage reads it back per
+// pixel, so neighbouring rows may agree or differ and nothing in this
+// predicate treats them as alternating.  That is why the orientation the
+// row actually offers is queried inside the placement predicate instead of
+// being fixed up afterwards.
 bool Opendp::checkPixels(const Node* cell,
                          const GridX x,
                          const GridY y,
@@ -1299,10 +1348,16 @@ bool Opendp::checkPixels(const Node* cell,
 // The per-pixel scan can only query the orientation of the bottom row, so
 // a multi-row cell still needs its whole span checked against the
 // architecture's row table, which records the rail polarity each row
-// actually presents.  A row index at or past the end of that table is
-// reported as incompatible rather than raised as an error, because it
-// means the candidate bottom edge lies above the last real row and there
-// is no row there whose polarity could match.
+// actually presents.
+//
+// The bounds test on the index that lookup returns is defensive rather
+// than an ordinary case: find_closest_row() clamps, handing back an index
+// inside the table for any coordinate once the table has rows in it, so a
+// candidate bottom edge above the topmost row comes back as the topmost
+// row and not as an overrun.  What the test therefore covers is the
+// degenerate table with no rows at all, and it answers incompatible rather
+// than raising, so such a candidate is rejected instead of the pass being
+// aborted.
 bool Opendp::checkRowPowerCompatible(const Node* cell, const GridY y) const
 {
   const int row_idx = arch_->find_closest_row(grid_->gridYToDbu(y));
@@ -1573,9 +1628,24 @@ void Opendp::legalCellPos(odb::dbInst* db_inst)
 }
 
 // The pre-legalization position, read from the database rather than from
-// the node.  It is the origin every diamond search starts from and the
-// reference every displacement in this file is measured against, and
-// reading it from the database is what keeps it stable: the node's own
+// the node.  It reaches a search only through legalPt(cell, padded) and the
+// legalGridPt() overload that wraps it, which is the origin used by the
+// one-argument diamondMove() - the default case, and the only one on the
+// general pass - by refineMove(), and by the rip-up window.  legalGridPt()
+// nudges it into the die, off any macro it landed on and out of a flagged
+// origin before the search begins.
+//
+// It is not the origin of every search, though.  prePlace(),
+// prePlaceGroups(), brickPlace1() and brickPlace2() all hand diamondMove()
+// an origin they picked themselves -- the nearest point of a fence-region
+// rectangle, or the nearest corner of the region a grouped cell belongs to
+// -- and the negotiation pass enters diamondSearch() at negotiation
+// coordinates.  Those points are computed from this position, so it remains
+// upstream of them, but the search they start does not begin here.
+//
+// It is also the reference distChange() and the displacement statistics
+// measure against.  Reading it from the database is what keeps it stable:
+// the node's own
 // coordinates are overwritten the moment a cell is committed, so after the
 // first move they would no longer say where global placement had put it.
 // Coordinates come back relative to the core origin.  The padded form
@@ -1670,9 +1740,15 @@ void Opendp::setGridLoc(Node* cell, const GridX x, const GridY y)
 // pixels while reporting stale coordinates would make later searches wrong
 // rather than merely worse.  The orientation is taken from the site the
 // cell actually landed on instead of being carried over, which is what
-// makes the parity checks upstream mean anything.  The journal entry
-// records where the cell came from, so the whole commit can be reversed;
-// that reversibility is what lets the rip-up path evict speculatively.
+// makes the parity checks upstream mean anything.  The journal entry is
+// written only when a caller has installed one through setJournal(), and it
+// records where the cell came from so that caller can reverse the move.
+// Nothing in this module installs a journal on the placer, so on the
+// legalization path the entry is not written at all; a caller wanting the
+// guarantee supplies its own, as swapCells() above does around its trial
+// exchange, rolling back through a journal it creates for itself.  In
+// particular ripUpAndReplace() does not rewind - it evicts, then calls
+// diamondMove() on each evicted cell again.
 void Opendp::placeCell(Node* cell, const GridX x, const GridY y)
 {
   const DbuX original_x = cell->getLeft();
@@ -1701,8 +1777,15 @@ void Opendp::placeCell(Node* cell, const GridX x, const GridY y)
 // their pixels are the obstruction map every search depends on.  The held
 // flag is cleared alongside the placed flag, so a cell a pre-placement
 // pass had pinned becomes an ordinary candidate again once it is lifted.
-// The journal entry is written before the pixels are erased, which is what
-// lets the rip-up path evict speculatively and still recover.
+// The journal entry, when a caller has installed one, is written before the
+// pixels are erased, so it still carries the hold state the erase is about
+// to discard.  Like the commit above it is bookkeeping for that caller
+// rather than a mechanism the fallback relies on: ripUpAndReplace() calls
+// this and then searches again, and it does so with no journal installed.
+// What actually lets that path evict and still recover is
+// Grid::erasePixel() clearing only the entries this cell owns, which leaves
+// every neighbour's pixels intact for the re-placement attempt that
+// follows.
 void Opendp::unplaceCell(Node* cell)
 {
   if (cell->isFixed() || !cell->isPlaced()) {

@@ -37,20 +37,36 @@ using utl::format_as;  // NOLINT(misc-unused-using-decls)
 // is reported under its own stable identifier and can be searched for on
 // its own; one combined list would collapse them into a single
 // unattributable error.  initGrid() and groupAssignCellRegions() must run
-// before the loop because every per-cell test below reads either the pixel
-// grid or a cell's assigned region, and neither exists until they do.
+// before the loop because every per-cell test below but one reads either
+// the pixel grid or a cell's assigned region, and neither exists until
+// they do.  The placed check is that one exception: it reads the
+// instance's own status and depends on neither.
 //
 // The order inside the per-cell loop is forced, not incidental:
 //   - Site alignment comes first and is the only check that abandons the
 //     rest of the cell.  A left edge that is not a multiple of the site
 //     width, or a bottom edge that is not exactly some row's origin, puts
-//     the cell off the site/row lattice altogether, and every later test
-//     is expressed in grid indices derived from that lattice - their
-//     verdicts would be meaningless, not merely negative.
+//     the cell off the site/row lattice altogether, and the tests that
+//     convert the cell into grid indices derived from that lattice - the
+//     in-rows scan, region placement, and the pixel claiming the overlap
+//     pass performs - would then return verdicts that are meaningless
+//     rather than merely negative.  Not every later test is in that class:
+//     the placed test reads the instance's placement status straight from
+//     the database, and the overlap test compares cell rectangles in
+//     database units.  The effect of abandoning the cell is that a
+//     misaligned cell is reported under site alignment and under nothing
+//     else, and that its padding is never painted, so no later cell is
+//     measured against a reservation it would have made.
 //   - Site alignment, in-rows and region placement are gated on
 //     isStdCell() because all three are assertions about the row lattice,
-//     which only core and endcap instances are obliged to occupy; blocks
-//     and pads remain subject to every check that follows.
+//     which only core and endcap instances are obliged to occupy.  What
+//     that gate lets past to the ungated checks is blocks: the network
+//     admits only masters OpenDB reports as core-auto-placeable, which
+//     covers the core, endcap and block families and excludes every pad
+//     variant outright, and this loop then skips any node not typed as a
+//     cell.  So no pad is ever among the cells checked here, and the
+//     ungated checks are being applied to blocks alongside standard
+//     cells.
 //   - The padding check deliberately precedes paintCellPadding(), so a
 //     cell is never rejected against its own reservation.  Reservations
 //     then accumulate as the loop advances, which suffices: a conflicting
@@ -391,9 +407,14 @@ bool Opendp::isPlaced(const Node* cell)
 // must take.  The query asks whether the row offers this cell's site at
 // that column at all, and in which orientation - ultimately a power-rail
 // question, since the supply rails run along a cell's top and bottom
-// edges, so consecutive rows admit opposite orientations.  A cell whose
-// site is unavailable there is not in that row however empty its pixels
-// are.
+// edges, so the polarity a cell meets follows from the orientation of its
+// row.  Nothing here is deduced from a row's position in the stack: that
+// orientation is a property of the individual row, the grid records
+// whatever each database row declared alongside the span of sites it
+// declared it for, this query reads it back, and powerCompatible() consults
+// that row's own rail assignment - so neighbouring rows may agree or differ
+// and nothing here treats them as alternating.  A cell whose site is
+// unavailable there is not in that row however empty its pixels are.
 //
 // For a multi-row master the first row settles nothing on its own: the
 // cell spans several rows and must present compatible rail polarity to

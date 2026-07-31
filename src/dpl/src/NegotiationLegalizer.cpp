@@ -1197,18 +1197,35 @@ std::vector<int> NegotiationLegalizer::runAbacus()
   // row left to right against that row's own capacity, and collapseClusters
   // only ever tests the newest cluster against its immediate predecessor.
   // Ordering by row, then by site within the row, hands cells to the sweep
-  // in the same sequence the row is packed in, so the row assignment
-  // snapToLegal makes and the packing abacusRow performs agree rather than
-  // disagreeing arbitrarily. The order is load-bearing, not cosmetic: row
-  // assignment is greedy and consumes capacity, so a cell considered
-  // earlier can claim sites a later one wanted; only a traversal fixed by
-  // the design's own geometry makes that outcome reproducible. Fixed cells
-  // are left out because they cannot move and already occupy the capacity
-  // model as obstructions, so ranking them would decide nothing. This is a
-  // positional order over grid indices (rows, then sites), unlike the
-  // default diamond-search engine's structural CellPlaceOrderLess, which
-  // ranks on multi-row, then area, then distance to the core centre in
-  // database units, then instance name (Place.cpp:L299-L319).
+  // in the same sequence the row is packed in, so the buckets built below
+  // start out close to the ascending-x sequence abacusRow needs.
+  //
+  // The snap pass this feeds does not itself race for sites: all movable
+  // usage is stripped just below before any cell is snapped, and snapToLegal
+  // is const and the only occupancy it consults is the static per-site
+  // capacity - never the usage that would let it see an earlier cell's claim
+  // - so one cell's row choice never denies a site to a later one, and the
+  // row and site it returns for a cell are the same whenever that cell is
+  // considered.  What the ordering settles is the input the Abacus sweep
+  // sees - which cells reach a bucket and in what sequence - and it settles
+  // it from the design's own geometry rather than from cell storage order.
+  //
+  // Observed characteristic: the comparison below is on position alone and
+  // stops there, with no further key. Two movable cells that start on the
+  // same row and the same column compare as equivalent, and the sort applied
+  // is not a stable one, so their relative order is left to whatever the
+  // standard library produces and may vary between runs, between standard
+  // library implementations and between platforms - the same characteristic
+  // the pass ordering in NegotiationLegalizerPass records for its own
+  // comparator.
+  //
+  // Fixed cells are left out because they cannot move and already occupy the
+  // capacity model as obstructions, so ranking them would decide nothing.
+  // This is a positional order over grid indices (rows, then sites), unlike
+  // the default diamond-search engine's structural CellPlaceOrderLess, whose
+  // operator() in Place.cpp ranks on multi-row, then area, then distance to
+  // the core centre in database units, then instance name, and so reaches a
+  // unique answer that this one does not.
   std::ranges::sort(order, [this](int a, int b) {
     if (cells_[a].y != cells_[b].y) {
       return cells_[a].y < cells_[b].y;
