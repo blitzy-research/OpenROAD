@@ -9,6 +9,10 @@ def swap_prefix(file, old, new):
         f.write(lines)
 
 
-for filename in ["../README.md", "../README2.md"]:
+for filename in [
+    "../README.md",
+    "../README2.md",
+    "../src/dpl/doc/LegalizationAlgorithm.md",
+]:
     swap_prefix(filename, "(../", "(docs/")
     swap_prefix(filename, "```{mermaid}\n:align: center\n", "```mermaid")
