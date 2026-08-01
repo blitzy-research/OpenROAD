@@ -53,10 +53,13 @@ multi-row cell, its power-rail parity (`src/dpl/src/Place.cpp:L1096-L1098`) are
 enforced as well. All of that is done while **minimally perturbing the global
 placement** it was handed, because the wirelength quality of that placement is
 the thing being preserved. The module measures how well it did exactly that way:
-it reports and publishes total, average and maximum *displacement*, meaning
-movement from each cell's original position
+it reports and publishes total, average and maximum *displacement*
 (`src/dpl/src/Opendp.cpp:L262-L294`), computed by `Opendp::disp` against the
-cell's initial location (`src/dpl/src/Opendp.cpp:L387-L391`).
+cell's initial location (`src/dpl/src/Opendp.cpp:L387-L391`). On the default
+engine — the subject of this document — that quantity really is movement from each
+cell's original position. On the optional engine the same three statistics measure
+something different, because of where that engine writes its results; the ordering
+is set out in [Reporting and statistics](#reporting-and-statistics).
 
 `Opendp::detailedPlacement` (`src/dpl/src/Opendp.cpp:L116`) is the entry point,
 and it selects between **two** legalization engines on a single flag. The
@@ -106,21 +109,28 @@ includes `optimization/detailed_orient.h`, `util/journal.h` and
 (`src/dpl/src/optimization/detailed_orient.cxx:L503`) at
 `src/dpl/src/Place.cpp:L1088`, the `Symmetry_X` / `Symmetry_Y` /
 `Symmetry_ROT90` bits (`src/dpl/src/util/symmetry.h:L9-L11`) at
-`src/dpl/src/Place.cpp:L1120-L1131`, and the `Journal`
-(`src/dpl/src/util/journal.h:L91`) to record moves and unplacements.
+`src/dpl/src/Place.cpp:L1120-L1131`, and names `Journal`
+(`src/dpl/src/util/journal.h:L91`) in `placeCell`, `unplaceCell` and `swapCells`
+— though only the last of those three actually constructs one, as
+[Supporting Objects](#supporting-objects) sets out.
 
-**D-1 — where legalization sits, and the invariant it establishes.**
+**D-1 — where legalization sits, and where the verifier sits relative to it.**
+Note the dotted edge: the verifier is *not* a stage the legalizer runs. It is a
+separate command an operator issues, and in the reference flow it is issued once,
+near the end (`test/flow.tcl:L248`).
 
 ```mermaid
 flowchart LR
-    GP["Global placement<br/>minimizes wirelength<br/>ignores the site grid"]
-    DPL["dpl legalization<br/>Opendp::detailedPlacement<br/>Opendp.cpp:L116"]
-    CHK["Opendp::checkPlacement<br/>CheckPlacement.cpp:L27-L138<br/>verifies the invariant"]
-    CTS["Clock-tree synthesis<br/>and downstream stages"]
+    GP["Global placement<br/>minimizes wirelength<br/>ignores the site grid<br/>test/flow.tcl:L61"]
+    DPL["dpl legalization<br/>Opendp::detailedPlacement<br/>Opendp.cpp:L116<br/>invoked at test/flow.tcl:L90, L119, L157"]
+    CTS["Clock-tree synthesis<br/>test/flow.tcl:L111<br/>then routing and the rest of the flow"]
+    LATE["Later stages, e.g. filler_placement<br/>test/flow.tcl:L247"]
+    CHK["Opendp::checkPlacement<br/>CheckPlacement.cpp:L27-L138<br/>a separate verifier reached only through<br/>the check_placement command;<br/>detailedPlacement never calls it"]
 
     GP -->|"overlapping cells at<br/>arbitrary coordinates"| DPL
-    DPL -->|"establishes: every movable std cell<br/>site-aligned, in a valid row,<br/>overlap-free, padding and edge-spacing<br/>clean, power-rail compatible"| CHK
-    CHK --> CTS
+    DPL -->|"intended result: every movable std cell<br/>site-aligned, in a valid row, overlap-free,<br/>padding and edge-spacing clean,<br/>power-rail compatible"| CTS
+    CTS --> LATE
+    LATE -. "operator issues check_placement -verbose<br/>test/flow.tcl:L248" .-> CHK
     DPL -->|"minimize displacement<br/>Opendp::disp<br/>Opendp.cpp:L387-L391"| DPL
 ```
 
@@ -130,6 +140,21 @@ Legality in this module is not an abstract notion; it is exactly the set of
 checks that the verifier enforces. `Opendp::checkPlacement`
 (`src/dpl/src/CheckPlacement.cpp:L27-L138`) *is* the operational definition, so
 reading it is the most reliable way to learn what "legal" means here.
+
+One thing to be clear about before reading further: **the verifier is not part of
+legalization**. `Opendp::detailedPlacement` (`src/dpl/src/Opendp.cpp:L116-L240`)
+never calls `checkPlacement`; nothing on the legalization path does. It is a
+separate entry point, reached only when an operator issues the `check_placement`
+command, and it re-imports the design and rebuilds the grid from scratch when it
+runs (`src/dpl/src/CheckPlacement.cpp:L30-L44`). In the repository's reference
+flow it is issued exactly once, at `test/flow.tcl:L248` — after
+`filler_placement` (`test/flow.tcl:L247`), and therefore long after the three
+`detailed_placement` calls at `test/flow.tcl:L90`, `L119` and `L157`. A
+legalization run that reports no failures has *not* been verified against the
+list below; it has only reported that it recorded no failure of its own. The
+distinction matters for the whole of this document, and it is restated where the
+legalizer's own success condition is described in
+[Terminal failure reporting](#terminal-failure-reporting).
 
 The function begins by rebuilding its view of the design: `importDb();` and
 `adjustNodesOrient();` (`src/dpl/src/CheckPlacement.cpp:L30-L31`), then declares
@@ -141,23 +166,38 @@ assigns cell regions before testing anything —
 region assignment are inputs to the checks that follow. The set of valid row
 coordinates is captured next (`src/dpl/src/CheckPlacement.cpp:L45`).
 
-The per-cell loop runs over the whole network
-(`src/dpl/src/CheckPlacement.cpp:L46-L85`) and applies, in source order:
+The per-cell loop iterates every node in the network
+(`src/dpl/src/CheckPlacement.cpp:L46-L85`), but it first discards anything that is
+not a movable cell: `if (cell->getType() != Node::CELL) { continue; }`
+(`src/dpl/src/CheckPlacement.cpp:L47-L49`). Terminals and every other
+`Node::Type` are therefore never examined by this verifier at all.
 
-1. **Site alignment**, under the comment `// Site alignment check`
-   (`src/dpl/src/CheckPlacement.cpp:L51`). The test is that the cell's left edge
-   is an exact multiple of the site width and that its bottom edge is a known
-   row coordinate (`src/dpl/src/CheckPlacement.cpp:L52-L53`). This check is
-   special: on failure it executes `continue`
-   (`src/dpl/src/CheckPlacement.cpp:L55`), so a mis-aligned cell **skips every
-   remaining per-cell check**. A single site-alignment failure therefore
-   suppresses the other diagnostics for that cell rather than accumulating
-   alongside them.
-2. **In rows** — `checkInRows` (`src/dpl/src/CheckPlacement.cpp:L58`), applied to
-   standard cells only.
-3. **Region placement** — `checkRegionPlacement`
-   (`src/dpl/src/CheckPlacement.cpp:L61`), also standard-cell only.
-4. **Placed**, under `// Placed check`
+The checks that survive that filter fall into **two tiers**, and the split is easy
+to miss. The first three sit inside `if (cell->isStdCell()) {`
+(`src/dpl/src/CheckPlacement.cpp:L50`), which closes at
+`src/dpl/src/CheckPlacement.cpp:L64`, so they are applied to standard cells only
+and are skipped silently for anything else — a macro or a block that happens to
+be a `Node::CELL` is never tested for site alignment, row membership or region
+containment here. The remaining five run for **every** `Node::CELL`, standard cell
+or not. In source order:
+
+1. **Site alignment** — *standard cells only* — under the comment
+   `// Site alignment check` (`src/dpl/src/CheckPlacement.cpp:L51`). The test is
+   that the cell's left edge is an exact multiple of the site width and that its
+   bottom edge is a known row coordinate
+   (`src/dpl/src/CheckPlacement.cpp:L52-L53`). This check is special: on failure
+   it records the cell and then executes `continue`
+   (`src/dpl/src/CheckPlacement.cpp:L54-L55`). Because that `continue` targets the
+   outer per-cell loop rather than the `isStdCell` block, a mis-aligned standard
+   cell **skips every remaining per-cell check** — including the five that are not
+   standard-cell-gated. A single site-alignment failure therefore suppresses the
+   other diagnostics for that cell rather than accumulating alongside them.
+2. **In rows** — *standard cells only* — `checkInRows`
+   (`src/dpl/src/CheckPlacement.cpp:L58`).
+3. **Region placement** — *standard cells only* — `checkRegionPlacement`
+   (`src/dpl/src/CheckPlacement.cpp:L61`).
+4. **Placed** — from here on, *every* `Node::CELL`, the `isStdCell` block having
+   closed at `src/dpl/src/CheckPlacement.cpp:L64` — under `// Placed check`
    (`src/dpl/src/CheckPlacement.cpp:L65`) — `isPlaced`
    (`src/dpl/src/CheckPlacement.cpp:L66`).
 5. **Overlap**, under `// Overlap check`
@@ -193,9 +233,26 @@ whether a one-site hole was left, so running it in the first loop would test a
 grid that is still being populated. The second loop is the fix for an ordering
 dependency, not a stylistic choice.
 
-Failures are then persisted with `saveFailures`
-(`src/dpl/src/CheckPlacement.cpp:L99-L108`) and optionally serialized with
-`writeJsonReport` (`src/dpl/src/CheckPlacement.cpp:L109-L111`).
+**Nothing is reported while either loop runs.** Every one of the eight per-cell
+tests above, and the ninth in the deferred loop, does exactly one thing on
+failure: it appends the offending cell to one of the nine vectors declared at
+`src/dpl/src/CheckPlacement.cpp:L33-L41`. The nine append sites are
+`src/dpl/src/CheckPlacement.cpp:L54`, `L59`, `L62`, `L67`, `L71`, `L75`, `L80`,
+`L83` and `L95`. Only after both loops have finished are those vectors persisted
+as violation markers with `saveFailures`
+(`src/dpl/src/CheckPlacement.cpp:L99-L108`); then serialized by `writeJsonReport`
+**only if a report file was named**, since that call is guarded by
+`if (!report_file_name.empty()) {` (`src/dpl/src/CheckPlacement.cpp:L109-L111`);
+then reported one vector at a time by the nine `reportFailures` calls
+(`src/dpl/src/CheckPlacement.cpp:L112-L124`); then published as the metric
+(`src/dpl/src/CheckPlacement.cpp:L125-L128`); and only then aggregated into the
+terminal verdict and its error (`src/dpl/src/CheckPlacement.cpp:L130-L138`).
+
+That ordering is worth internalizing before reading the table below: a `DPL 3`
+through `DPL 11` message is emitted in a batch after the entire design has been
+walked, not at the moment the offending cell was examined. The messages therefore
+appear grouped by *check*, in the fixed order of the nine `reportFailures` calls
+— never interleaved in cell order.
 
 ### The Nine Reported Checks
 
@@ -205,15 +262,15 @@ ascending numeric order**: identifier 11 is emitted between 5 and 6.
 
 | DPL id | Check | Reported at |
 |---|---|---|
-| 3 | Placed | `CheckPlacement.cpp:L112` |
-| 4 | Placed in rows | `CheckPlacement.cpp:L113` |
-| 5 | Overlap | `CheckPlacement.cpp:L114-L117` (with the `reportOverlapFailure` callback at `L116`) |
-| 11 | Padding | `CheckPlacement.cpp:L118` |
-| 6 | Site aligned | `CheckPlacement.cpp:L119` |
-| 7 | One site gap | `CheckPlacement.cpp:L120` |
-| 8 | Region placement | `CheckPlacement.cpp:L121` |
-| 9 | LEF58_CELLEDGESPACINGTABLE | `CheckPlacement.cpp:L122-L123` |
-| 10 | Blocked layers | `CheckPlacement.cpp:L124` |
+| 3 | Placed | `src/dpl/src/CheckPlacement.cpp:L112` |
+| 4 | Placed in rows | `src/dpl/src/CheckPlacement.cpp:L113` |
+| 5 | Overlap | `src/dpl/src/CheckPlacement.cpp:L114-L117` (with the `reportOverlapFailure` callback at `L116`) |
+| 11 | Padding | `src/dpl/src/CheckPlacement.cpp:L118` |
+| 6 | Site aligned | `src/dpl/src/CheckPlacement.cpp:L119` |
+| 7 | One site gap | `src/dpl/src/CheckPlacement.cpp:L120` |
+| 8 | Region placement | `src/dpl/src/CheckPlacement.cpp:L121` |
+| 9 | LEF58_CELLEDGESPACINGTABLE | `src/dpl/src/CheckPlacement.cpp:L122-L123` |
+| 10 | Blocked layers | `src/dpl/src/CheckPlacement.cpp:L124` |
 
 Two aggregations follow (`src/dpl/src/CheckPlacement.cpp:L125-L128` and
 `src/dpl/src/CheckPlacement.cpp:L130-L138`), and they do **not** cover the same
@@ -223,10 +280,14 @@ ground:
   (`src/dpl/src/CheckPlacement.cpp:L125-L128`) sums only **five of the nine**
   vectors: placed, in-rows, overlap, padding and site-aligned. Region placement,
   one-site gap, edge spacing and blocked layers are excluded from the metric.
-- The terminal aggregation (`src/dpl/src/CheckPlacement.cpp:L130-L138`) sums
-  **all nine**, with the one-site-gap term included conditionally on
-  `disallow_one_site_gaps_` (`src/dpl/src/CheckPlacement.cpp:L132`). If that
-  total is non-zero it raises `DPL 33`
+- The terminal aggregation (`src/dpl/src/CheckPlacement.cpp:L130-L138`) is a
+  **single** `if` whose condition adds **all nine** vector sizes into one total
+  and compares that one total against zero
+  (`src/dpl/src/CheckPlacement.cpp:L130-L135`) — the one-site-gap term being the
+  only conditional contributor, included only when `disallow_one_site_gaps_` is
+  set (`src/dpl/src/CheckPlacement.cpp:L132`). It is not nine separate tests: any
+  single non-empty vector is sufficient. If that total is non-zero it raises
+  `DPL 33`
   `"detailed placement checks failed during check placement."`
   (`src/dpl/src/CheckPlacement.cpp:L136-L137`).
 
@@ -251,32 +312,47 @@ The check implementations are `checkInRows`
 (`src/dpl/src/CheckPlacement.cpp:L282` and `L292`) and `reportOverlapFailure`
 (`src/dpl/src/CheckPlacement.cpp:L309`).
 
-**D-7 — the verification sequence, with the deferred second loop.**
+**D-7 — the verification sequence: the two-tier per-cell filter, the deferred
+second loop, detection before reporting, and the single aggregate verdict.** Every
+check node below only *appends to a vector* and emits nothing; every `DPL`
+identifier is emitted afterwards by the `reportFailures` calls near the bottom, in
+the order shown, which is why the identifiers are attached to the reporting node
+rather than to the detection nodes.
 
 ```mermaid
 flowchart TD
     A["checkPlacement<br/>CheckPlacement.cpp:L27"] --> B["importDb, adjustNodesOrient<br/>L30-L31"]
     B --> C["declare 9 failure vectors<br/>L33-L41"]
     C --> D["initGrid, groupAssignCellRegions<br/>L43-L44"]
-    D --> E["LOOP 1 over all nodes<br/>L46-L85"]
-    E --> F{"site aligned?<br/>L52-L53"}
-    F -->|no| F1["DPL 6, then continue<br/>L54-L55<br/>skips all later per-cell checks"]
-    F -->|yes| G["checkInRows, DPL 4, L58"]
-    G --> H["checkRegionPlacement, DPL 8, L61"]
-    H --> I["isPlaced, DPL 3, L66"]
-    I --> J["checkOverlap, DPL 5, L70<br/>SIDE EFFECT: pixel-&gt;cell = &amp;cell, L370"]
-    J --> K["checkPadding, DPL 11, L74<br/>then paintCellPadding, L77"]
-    K --> L["checkEdgeSpacing, DPL 9, L79"]
-    L --> M["checkBlockedLayers, DPL 10, L82"]
-    M --> N{"disallow_one_site_gaps_?<br/>L91"}
-    F1 --> N
-    N -->|yes| O["LOOP 2, deferred<br/>checkOneSiteGaps, DPL 7<br/>L92-L97<br/>needs LOOP 1 pixel assignment"]
-    N -->|no| P["saveFailures, L99-L108"]
+    D --> E["LOOP 1: for each node in the network<br/>L46-L85<br/>DETECTION ONLY, emits nothing"]
+    E --> E1{"getType == Node::CELL?<br/>L47"}
+    E1 -->|no| NEXT["continue to the next node"]
+    E1 -->|yes| E3{"isStdCell?<br/>L50 - gate closes at L64"}
+    E3 -->|yes| F{"site aligned?<br/>L52-L53"}
+    F -->|no| F1["append site_align_failures, L54<br/>then continue, L55<br/>skips ALL later per-cell checks,<br/>including the non-gated five"]
+    F1 --> NEXT
+    F -->|yes| G["checkInRows<br/>append in_rows_failures<br/>L58-L60"]
+    G --> H["checkRegionPlacement<br/>append region_placement_failures<br/>L61-L63"]
+    H --> I["isPlaced<br/>append placed_failures<br/>L66-L68"]
+    E3 -->|"no: skips checks 1-3"| I
+    I --> J["checkOverlap<br/>append overlap_failures<br/>L70-L72<br/>SIDE EFFECT: pixel-&gt;cell = &amp;cell, L370"]
+    J --> K["checkPadding<br/>append padding_failures<br/>L74-L76<br/>then paintCellPadding, L77"]
+    K --> L["checkEdgeSpacing<br/>append edge_spacing_failures<br/>L79-L81"]
+    L --> M["checkBlockedLayers<br/>append blocked_layers_failures<br/>L82-L84"]
+    M --> NEXT
+    NEXT -->|"more nodes"| E
+    NEXT -->|"LOOP 1 exhausted"| N{"disallow_one_site_gaps_?<br/>L91"}
+    N -->|yes| O["LOOP 2, deferred<br/>checkOneSiteGaps<br/>append one_site_gap_failures<br/>L92-L97<br/>needs LOOP 1 pixel assignment"]
+    N -->|no| P["saveFailures: persist<br/>violation markers<br/>L99-L108"]
     O --> P
-    P --> Q["metric design__violations<br/>sums 5 of 9, L125-L128"]
-    Q --> R{"all 9 sums &gt; 0?<br/>L130-L135"}
-    R -->|yes| S["DPL 33 error<br/>L136-L137"]
-    R -->|no| T["placement is legal"]
+    P --> Q{"report_file_name empty?<br/>L109"}
+    Q -->|no| R["writeJsonReport, L110<br/>CONDITIONAL"]
+    Q -->|yes| S["FIRST output: reportFailures once per vector,<br/>DPL 3, 4, 5, 11, 6, 7, 8, 9, 10<br/>grouped by check, not by cell<br/>L112-L124"]
+    R --> S
+    S --> T["metric design__violations<br/>sums 5 of the 9 vectors, L125-L128"]
+    T --> U{"ONE total: sum of all 9 vector sizes,<br/>one-site-gap term only if enabled,<br/>&gt; 0?<br/>L130-L135"}
+    U -->|yes| V["DPL 33 error<br/>L136-L137"]
+    U -->|no| W["no failure recorded by any of<br/>the nine checks: check_placement passes"]
 ```
 
 ## Key Data Structures
@@ -311,17 +387,17 @@ Each pixel carries the following state
 
 | Field | Line | Meaning |
 |---|---|---|
-| `Node* cell` | `Grid.h:L44` | the cell currently occupying this pixel, or null |
-| `Group* group` | `Grid.h:L45` | the fence region that owns this pixel, or null |
-| `float util` | `Grid.h:L46` | utilization contribution |
-| `bool is_valid` | `Grid.h:L47` | annotated in source as `false for dummy cells`; a real site exists here |
-| `bool is_hopeless` | `Grid.h:L48` | annotated in source as `too far from sites for diamond search` |
-| `uint8_t blocked_layers` | `Grid.h:L49` | routing layers blocked at this pixel |
-| `Node* padding_reserved_by` | `Grid.h:L51` | under the comment `// Cell that reserved this pixel for padding` at `L50` |
-| `int capacity` | `Grid.h:L54` | negotiation-engine data, annotated `1 if site exists, 0 if blockage` |
-| `int usage` | `Grid.h:L55` | negotiation-engine occupancy count |
-| `double hist_cost` | `Grid.h:L56` | negotiation-engine history cost |
-| `overuse()` | `Grid.h:L58` | `std::max(usage - capacity, 0)`, used only by the negotiation engine |
+| `Node* cell` | `src/dpl/src/infrastructure/Grid.h:L44` | the cell currently occupying this pixel, or null |
+| `Group* group` | `src/dpl/src/infrastructure/Grid.h:L45` | the fence region that owns this pixel, or null |
+| `float util` | `src/dpl/src/infrastructure/Grid.h:L46` | utilization contribution |
+| `bool is_valid` | `src/dpl/src/infrastructure/Grid.h:L47` | annotated in source as `false for dummy cells`; a real site exists here |
+| `bool is_hopeless` | `src/dpl/src/infrastructure/Grid.h:L48` | annotated in source as `too far from sites for diamond search` |
+| `uint8_t blocked_layers` | `src/dpl/src/infrastructure/Grid.h:L49` | routing layers blocked at this pixel |
+| `Node* padding_reserved_by` | `src/dpl/src/infrastructure/Grid.h:L51` | under the comment `// Cell that reserved this pixel for padding` at `L50` |
+| `int capacity` | `src/dpl/src/infrastructure/Grid.h:L54` | negotiation-engine data, annotated `1 if site exists, 0 if blockage` |
+| `int usage` | `src/dpl/src/infrastructure/Grid.h:L55` | negotiation-engine occupancy count |
+| `double hist_cost` | `src/dpl/src/infrastructure/Grid.h:L56` | negotiation-engine history cost |
+| `overuse()` | `src/dpl/src/infrastructure/Grid.h:L58` | `std::max(usage - capacity, 0)`, used only by the negotiation engine |
 
 The last four fields are grouped in source under `// Hybrid negotiation data`
 (`src/dpl/src/infrastructure/Grid.h:L53`) and are not consulted by the
@@ -348,10 +424,10 @@ snapping to rows (`src/dpl/src/infrastructure/Grid.h:L216-L217`):
 
 | Table | Line | Direction |
 |---|---|---|
-| `std::map<DbuY, GridY> row_y_dbu_to_index_` | `Grid.h:L218` | database-unit coordinate to row index |
-| `std::vector<DbuY> row_index_to_y_dbu_` | `Grid.h:L219` | row index to database-unit coordinate (annotated `index is GridY`) |
-| `std::vector<DbuY> row_index_to_pixel_height_` | `Grid.h:L220` | row index to that row's height (annotated `index is GridY`) |
-| `std::vector<RowSitesMap> row_sites_` | `Grid.h:L223` | an interval map of the valid site spans in each row, under `// Indexed by row (GridY)` at `L222` |
+| `std::map<DbuY, GridY> row_y_dbu_to_index_` | `src/dpl/src/infrastructure/Grid.h:L218` | database-unit coordinate to row index |
+| `std::vector<DbuY> row_index_to_y_dbu_` | `src/dpl/src/infrastructure/Grid.h:L219` | row index to database-unit coordinate (annotated `index is GridY`) |
+| `std::vector<DbuY> row_index_to_pixel_height_` | `src/dpl/src/infrastructure/Grid.h:L220` | row index to that row's height (annotated `index is GridY`) |
+| `std::vector<RowSitesMap> row_sites_` | `src/dpl/src/infrastructure/Grid.h:L223` | an interval map of the valid site spans in each row, under `// Indexed by row (GridY)` at `L222` |
 
 Related state completes the picture: `has_hybrid_rows_`
 (`src/dpl/src/infrastructure/Grid.h:L225`), `core_`
@@ -396,14 +472,34 @@ does; that is recorded as observation **O1** in
 Independently of any of that, the vertical axis of the search's distance is
 always resolved through a table rather than computed from a constant, because
 `Grid::gridYToDbu` (`src/dpl/src/infrastructure/Grid.cpp:L664-L670`) consults
-the coordinate table unconditionally: `return row_index_to_y_dbu_.at(y.v);`
-(`src/dpl/src/infrastructure/Grid.cpp:L669`), and falls back to the core's top
-edge at the one-past-the-end sentinel index —
-`if (y == row_index_to_y_dbu_.size()) {`
-(`src/dpl/src/infrastructure/Grid.cpp:L666`) returning `DbuY{core_.yMax()}`
-(`src/dpl/src/infrastructure/Grid.cpp:L667`). The sentinel is what makes the
-extra `yHi` entry described at `Grid.h:L216-L217` usable as an exclusive upper
-bound.
+the coordinate table: `return row_index_to_y_dbu_.at(y.v);`
+(`src/dpl/src/infrastructure/Grid.cpp:L669`).
+
+Two distinct things guard the top of that table, and running them together is the
+easiest mistake to make here, so keep them apart:
+
+- **The stored boundary entry.** `Grid::examineRows` inserts *two* keys per row
+  into `row_y_dbu_to_index_` — the row's own `y_lo` and `y_lo + site height`
+  (`src/dpl/src/infrastructure/Grid.cpp:L714-L715`) — and then pushes **every**
+  key of that map into `row_index_to_y_dbu_`
+  (`src/dpl/src/infrastructure/Grid.cpp:L738-L742`). The top edge of the topmost
+  row is therefore a **real element of the vector**, at index `row_count_`, which
+  is itself defined as one less than that map's size
+  (`src/dpl/src/infrastructure/Grid.cpp:L769`). This is the extra `yHi` value the
+  field's own comment describes
+  (`src/dpl/src/infrastructure/Grid.h:L216-L217`), and it is what makes an
+  exclusive upper bound expressible. `gridYToDbu(row_count_)` is served by the
+  ordinary `.at()` lookup — no fallback is involved.
+- **The one-past-the-end fallback.** *Separately*, `gridYToDbu` tests
+  `if (y == row_index_to_y_dbu_.size())`
+  (`src/dpl/src/infrastructure/Grid.cpp:L666`) and returns `DbuY{core_.yMax()}`
+  (`src/dpl/src/infrastructure/Grid.cpp:L667`). Since the vector's size is
+  `row_count_ + 1`, that branch is reached only at index `row_count_ + 1` — one
+  step *beyond* the stored boundary entry, not at it. It serves callers that ask
+  for `y + 1` while `y` is already the last valid index, as at
+  `src/dpl/src/Opendp.cpp:L570-L572` and
+  `src/dpl/src/graphics/Graphics.cpp:L192-L194`. Any index above that falls
+  through to `.at()` and throws.
 
 `Grid::examineRows` (`src/dpl/src/infrastructure/Grid.cpp:L697`) is what
 populates these tables from the database, `Grid::rowHeight`
@@ -416,13 +512,40 @@ produces the coordinate set that the site-alignment check consumes at
 
 Grid indices and database units are different types, not different variables of
 the same type. `struct TypedCoordinate`
-(`src/dpl/src/infrastructure/Coordinates.h:L26-L38`) is the wrapper the aliases are
-built from, and its header comment says why multiplication and division are
-deliberately left undefined on it: those operations are often used to convert
-between database units and pixels, and such conversions must be explicit about the
-resulting type (`src/dpl/src/infrastructure/Coordinates.h:L20-L24`). Only explicit
-helpers convert between the two spaces
-(`src/dpl/src/infrastructure/Coordinates.h:L195-L223`):
+(`src/dpl/src/infrastructure/Coordinates.h:L26-L38`) is the wrapper the aliases
+are built from. It inherits a stack of Boost operator mix-ins
+(`src/dpl/src/infrastructure/Coordinates.h:L27-L38`): `totally_ordered`,
+`additive`, `modable`, **`dividable`** and **`multipliable`** each in both the
+same-type and the `int` form, plus `incrementable` and `decrementable`. The two in
+bold are the ones that matter here, and the type supplies their matching
+compound-assignment operators:
+`operator/=(const TypedCoordinate&)` and `operator/=(const int)`
+(`src/dpl/src/infrastructure/Coordinates.h:L90-L99`), under the comment
+`// dividable` at `src/dpl/src/infrastructure/Coordinates.h:L89`, and
+`operator*=(const TypedCoordinate&)` and `operator*=(const int)`
+(`src/dpl/src/infrastructure/Coordinates.h:L101-L110`), under `// multipliable`
+at `src/dpl/src/infrastructure/Coordinates.h:L100`.
+
+So multiplication and division **are** available on these types: the two
+compound-assignment forms are defined, and the mix-ins derive the corresponding
+binary `*` and `/` for same-type operands and for a coordinate combined with a
+plain `int`. Note that the type's own header comment
+(`src/dpl/src/infrastructure/Coordinates.h:L20-L24`) states the opposite; it says
+multiplication and division are "intentionally not defined" because they are often
+used to convert between DBUs and pixels and such conversions must be explicit
+about the resulting type. That comment records the *intent*, and the intent is a
+useful thing to know, but the declarations above are what the compiler sees. The
+mismatch is recorded as observation **O2** in
+[Recorded observations index](#recorded-observations-index) and is not corrected
+here.
+
+What the type system genuinely does prevent is *cross-space* arithmetic. There is
+no operator that will multiply a `GridX` by a `DbuX`, or add a `DbuX` to a `DbuY`,
+because the mix-ins are instantiated per `TypedCoordinate<T>` and `T` differs
+between the aliases. Every conversion between the two spaces, and every
+combination of an X term with a Y term, therefore has to go through an explicit
+free function that names the resulting type
+(`src/dpl/src/infrastructure/Coordinates.h:L195-L228`):
 
 - `gridToDbu(GridX x, DbuX scale)` returns `DbuX{x.v * scale.v}`
   (`src/dpl/src/infrastructure/Coordinates.h:L195-L198`), with the `GridY`
@@ -456,8 +579,9 @@ the frontier's `std::unordered_set<GridPt>` could not be instantiated.
 
 ### The Search Frontier
 
-The frontier is three collaborating objects, all declared inside
-`Opendp::diamondSearch` (`src/dpl/src/Place.cpp:L880-L893`):
+The frontier is three collaborating objects, all declared in the body of
+`Opendp::diamondSearch` (`src/dpl/src/Place.cpp:L839`), at
+`src/dpl/src/Place.cpp:L880-L893`:
 
 1. **The entry type** — a local `struct PQ_entry`
    (`src/dpl/src/Place.cpp:L880-L890`) carrying a distance, a grid point and a
@@ -494,8 +618,9 @@ and while recording what it did; they are its own members
   the legality predicate calls.
 - **Network** — `src/dpl/src/infrastructure/network.h` declares `Network`
   (`L32`) and exposes the node container through `getNodes` (`L35`). The **order**
-  of that container is the foundation of the module's determinism, as
-  [The Determinism Foundation](#the-determinism-foundation) explains.
+  of that container is what every pass that does not re-sort inherits, which is one
+  of the two determinism guarantees described in
+  [The Determinism Foundation](#the-determinism-foundation).
 - **Design-rule engine** — `src/dpl/src/PlacementDRC.h` declares the interface
   invoked as the final stage of the legality predicate, and the same engine
   supplies the padding, edge-spacing and blocked-layer checks used by the
@@ -503,31 +628,69 @@ and while recording what it did; they are its own members
   `src/dpl/src/CheckPlacement.cpp:L79`, `src/dpl/src/CheckPlacement.cpp:L82`).
 - **Journal** — `src/dpl/src/util/journal.h` declares `JournalActionTypeEnum`
   (`L17`), `JournalAction` (`L22`), `MoveCellAction` (`L28`),
-  `UnplaceCellAction` (`L73`) and `Journal` (`L91`). These are the records that
-  make the rip-up path reversible: `Opendp::placeCell` appends a
-  `MoveCellAction` (`src/dpl/src/Place.cpp:L1430-L1438`) and
-  `Opendp::unplaceCell` appends an `UnplaceCellAction`
-  (`src/dpl/src/Place.cpp:L1446-L1449`), each only when a journal has been
-  installed via `Opendp::setJournal` (`src/dpl/src/Opendp.cpp:L106`).
+  `UnplaceCellAction` (`L73`) and `Journal` (`L91`). Read the placer's use of it
+  carefully, because the machinery is present but **dormant on the legalization
+  path**. `Opendp::placeCell` appends a `MoveCellAction` and
+  `Opendp::unplaceCell` appends an `UnplaceCellAction`, but each is wrapped in
+  `if (journal_) {` (`src/dpl/src/Place.cpp:L1430-L1438` and
+  `src/dpl/src/Place.cpp:L1446-L1449`). The member `Journal* journal_ = nullptr;`
+  (`src/dpl/include/dpl/Opendp.h:L366`) is only ever assigned by
+  `Opendp::setJournal` (`src/dpl/include/dpl/Opendp.h:L170`;
+  `src/dpl/src/Opendp.cpp:L106-L109`) — and **nothing in this module, or anywhere
+  else under `src/`, calls `setJournal`**. On every path this document describes,
+  `journal_` is therefore null, both guards are false, and no record is written at
+  all. The rip-up path in particular does **not** rewind through a journal; it
+  evicts cells and searches for them again, as
+  [Commit and eviction](#commit-and-eviction) sets out.
+
+  There is exactly one place in the module where a journal is real and an undo
+  actually happens, and it is not on the legalization path.
+  `Opendp::swapCells` (`src/dpl/src/Place.cpp:L756-L801`) constructs its **own
+  local** `Journal journal(grid_.get(), nullptr);`
+  (`src/dpl/src/Place.cpp:L767`), hand-builds two `MoveCellAction` records and
+  adds them (`src/dpl/src/Place.cpp:L768-L782`), performs the swap, and calls
+  `journal.undo()` (`src/dpl/src/Place.cpp:L797`) when the post-swap design-rule
+  check fails (`src/dpl/src/Place.cpp:L794-L797`). That local object is unrelated
+  to `journal_`, which is why the two `if (journal_)` guards inside `placeCell`
+  and `unplaceCell` stay false even here.
 - **Debug observer** — `src/dpl/src/graphics/DplObserver.h` declares
   `DplObserver` (`L30`) with `startPlacement` (`L35`), `drawSelected` (`L36`),
   `binSearch` (`L37`) and `redrawAndPause` (`L43`). Every call site is guarded on
   the observer being non-null, so the engine is headless by default.
 
-**D-8 — the data model.**
+  There are, however, **two independent debug gates**, and they are not
+  interchangeable. `debug_observer_`
+  (`src/dpl/include/dpl/Opendp.h:L394`) is installed only by `Opendp::setDebug`
+  (`src/dpl/src/Opendp.cpp:L83`), which the Tcl layer calls **only when the GUI is
+  active** — `if (dpl::Graphics::guiActive()) {`
+  (`src/dpl/src/Opendp.i:L116-L120`). `iterative_debug_`
+  (`src/dpl/include/dpl/Opendp.h:L398`) is a plain flag set by
+  `Opendp::setIterativePlacement` (`src/dpl/src/Opendp.cpp:L93`), which that same
+  Tcl layer calls **unconditionally** (`src/dpl/src/Opendp.i:L114`), alongside
+  `setJumpMoves` (`L113`) and `setDeepIterativePlacement` (`L115`). So
+  `iterative_debug_` reporting is available headlessly while anything guarded on
+  `debug_observer_` is not, and `Opendp::deepIterativePause` needs **both**
+  (`src/dpl/src/Place.cpp:L674`).
+
+**D-8 — the data model.** UML visibility markers are used literally: `+` is a
+`public` declaration and `-` a `private` one, as declared in the header cited for
+each class. Note in particular that of the nine `Opendp` operations shown, only
+`detailedPlacement` (`src/dpl/include/dpl/Opendp.h:L107`) and `checkPlacement`
+(`src/dpl/include/dpl/Opendp.h:L130`) are public — the whole of the legalization
+machinery this document describes is private to the class.
 
 ```mermaid
 classDiagram
     class Opendp {
         +detailedPlacement()
-        +diamondDPL()
-        +place()
-        +diamondSearch() PixelPt
-        +calcDist() int
-        +canBePlaced() bool
-        +checkPixels() bool
-        +ripUpAndReplace() bool
         +checkPlacement()
+        -diamondDPL()
+        -place()
+        -diamondSearch() PixelPt
+        -calcDist() int
+        -canBePlaced() bool
+        -checkPixels() bool
+        -ripUpAndReplace() bool
         -max_displacement_x_ int
         -max_displacement_y_ int
         -placement_failures_ vector
@@ -652,8 +815,9 @@ comparator.
 The constructor (`src/dpl/src/Place.cpp:L285-L291`) computes and stores the
 **core centre** once, as
 `center_x_((core.xMin() + core.xMax()) / 2)` (`src/dpl/src/Place.cpp:L287`) and
-`center_y_((core.yMin() + core.yMax()) / 2)` (`src/dpl/src/Place.cpp:L288`), so
-the third key costs nothing per comparison beyond two subtractions.
+`center_y_((core.yMin() + core.yMax()) / 2)` (`src/dpl/src/Place.cpp:L288`), so the
+reference point the third key measures against is precomputed rather than derived
+inside each comparison.
 
 `CellPlaceOrderLess::centerDist` (`src/dpl/src/Place.cpp:L293-L297`) is
 `sumXY(abs(cell->getLeft() - center_x_), abs(cell->getBottom() - center_y_))`.
@@ -679,10 +843,10 @@ per operand up front (`src/dpl/src/Place.cpp:L301-L302`).
 
 | # | Key | Direction | Evaluated at |
 |---|---|---|---|
-| 1 | multi-row versus single-row | multi-row first | `Place.cpp:L304-L306` — `if (is_multi_row1 != is_multi_row2) { return is_multi_row1; }` |
-| 2 | cell area | larger first | `Place.cpp:L312` — `area1 > area2` |
-| 3 | `centerDist` to the core centre | smaller first | `Place.cpp:L314` — `dist1 < dist2` |
-| 4 | instance name | ascending | `Place.cpp:L316-L318` — `strcmp` on `getConstName()` |
+| 1 | multi-row versus single-row | multi-row first | `src/dpl/src/Place.cpp:L304-L306` — `if (is_multi_row1 != is_multi_row2) { return is_multi_row1; }` |
+| 2 | cell area | larger first | `src/dpl/src/Place.cpp:L312` — `area1 > area2` |
+| 3 | `centerDist` to the core centre | smaller first | `src/dpl/src/Place.cpp:L314` — `dist1 < dist2` |
+| 4 | instance name | ascending | `src/dpl/src/Place.cpp:L316-L318` — `strcmp` on `getConstName()` |
 
 The chain is written in two parts. Key 1 stands apart from the other three: it is
 an early return (`src/dpl/src/Place.cpp:L304-L306`) taken before area, distance or
@@ -795,22 +959,40 @@ follows from the two facts this section opened with — each cell is placed into
 grid already holding every cell placed before it
 (`src/dpl/src/Place.cpp:L384-L404` and `src/dpl/src/Place.cpp:L1426`), and an
 occupied pixel rejects a candidate outright
-(`src/dpl/src/Place.cpp:L1027`). The default path earns its reproducibility in
-three layers — the first of them the non-stable sort at
-`src/dpl/src/Place.cpp:L381` — and the bottom layer is easy to miss.
+(`src/dpl/src/Place.cpp:L1027`).
 
-**Layer 1 — the sort is not stable.** The general pass sorts with
+The default path earns its reproducibility from **two independent guarantees**,
+and the most common mistake made about this module is to treat them as one chain.
+They are not stacked; neither is derived from the other:
+
+- **Guarantee A — the placement order.** The permutation the sorted placement pass
+  commits cells in is fixed entirely by `CellPlaceOrderLess` ending in a
+  comparison of unique instance names (`src/dpl/src/Place.cpp:L316-L318`). This
+  holds *whatever order the candidates arrived in*, so it does **not** depend on
+  Guarantee B.
+- **Guarantee B — the un-reordered traversals.** The name-ordered `stable_sort` at
+  network construction (`src/dpl/src/dbToOpendp.cpp:L259-L260`) fixes the node
+  sequence, the node identifiers, and the order seen by every consumer that walks
+  `network_->getNodes()` and acts on what it finds *without reordering it*. The
+  sorted placement pass is not such a consumer — it reorders — so Guarantee B
+  contributes nothing to Guarantee A.
+
+The rest of this subsection takes them in that order.
+
+**Guarantee A — the comparator alone fixes the placement order.** Start with the
+fact that makes it necessary: **the sort is not stable.** The general pass sorts
+with
 `std::ranges::sort(sorted_cells, CellPlaceOrderLess(core_, this));`
 (`src/dpl/src/Place.cpp:L381`), and `std::ranges::sort` gives no guarantee about
 the relative order of elements the comparator calls equivalent. Nothing about the
 sort call preserves input order.
 
-**Layer 2 — so the comparator must be total, and the name key is what makes it
-total.** Because the sort discards input order for equivalent elements, the only
-way to get a unique output permutation is for the comparator to declare no two
-distinct cells equivalent. That is the entire job of the `strcmp` on instance
-names (`src/dpl/src/Place.cpp:L316-L318`), and it is what scopes the guarantee:
-what follows applies to the two sorts that use `CellPlaceOrderLess`
+**So the comparator must be total, and the name key is what makes it total.**
+Because the sort discards input order for equivalent elements, the only way to get
+a unique output permutation is for the comparator to declare no two distinct cells
+equivalent. That is the entire job of the `strcmp` on instance names
+(`src/dpl/src/Place.cpp:L316-L318`), and it is what scopes the guarantee: it
+applies to the two sorts that use `CellPlaceOrderLess`
 (`src/dpl/src/Place.cpp:L381` and `src/dpl/src/Place.cpp:L449`) and not to the
 secondary sorts, whose comparators can tie — see
 [Secondary Orderings](#secondary-orderings). Remove that key and the first three
@@ -818,8 +1000,19 @@ would leave genuine ties — same row-span class, same area, same centre distanc
 is common in a design built from a standard cell library — and the resulting
 order would be whatever the sort implementation happened to produce.
 
-**Layer 3 — and the input order itself is name-ordered, stably, before any of
-this runs.** When the network is built, `Opendp::createNetwork`
+**And that is the whole of Guarantee A.** Because a strict total order on a set
+determines exactly one arrangement of that set, the output permutation is a
+function of the *set* of candidates and not of the sequence they were collected
+in. The pass could be handed its candidates in any order — reverse, shuffled,
+database order — and would commit them identically. Both halves of that argument
+are on the page already: the sort is `std::ranges::sort`
+(`src/dpl/src/Place.cpp:L381`), which keeps no input order, and the comparator ends
+in a comparison of unique names (`src/dpl/src/Place.cpp:L316-L318`), which leaves
+it nothing to keep.
+
+**Guarantee B — the network sort fixes the un-reordered traversals.** A separate
+mechanism, with a separate job. When the network is built,
+`Opendp::createNetwork`
 (`src/dpl/src/dbToOpendp.cpp:L244`) copies the block's instances into a vector
 (`src/dpl/src/dbToOpendp.cpp:L257-L258`) and sorts them by name:
 
@@ -834,26 +1027,44 @@ instances that are not placeable under
 `// Skip instances which are not placeable.`
 (`src/dpl/src/dbToOpendp.cpp:L263-L264`).
 
-**Why layer 3 exists:** the database's own instance iteration order is an
+**Why this sort exists:** the database's own instance iteration order is an
 implementation detail of the database, and it is not guaranteed to be the same
-across builds, platforms or even across designs that differ only in how they were
-loaded. Sorting by name once, at network construction, makes the node container's
-order a pure function of the design's names. Every downstream traversal **of that
-container** inherits the order: the eligibility scan at
-`src/dpl/src/Place.cpp:L366-L380`, `Opendp::prePlace`
-(`src/dpl/src/Place.cpp:L125`), `Opendp::refine`
-(`src/dpl/src/Place.cpp:L607`), and the verifier's loops at
-`src/dpl/src/CheckPlacement.cpp:L46` and `src/dpl/src/CheckPlacement.cpp:L92`.
-This is the foundation the other two layers stand on.
+across builds, platforms or even across two databases describing the same netlist.
+Sorting by name once, at network construction, makes the node container's order a
+pure function of the design's names. Because `Network::addNode`
+(`src/dpl/src/infrastructure/network.h:L55`) numbers every node with its own
+index — `const int id = nodes_.size(); ndi.setId(id);`
+(`src/dpl/src/infrastructure/network.cxx:L383-L384`) — the node **identifiers**
+become a pure function of the design too.
+
+**What Guarantee B actually covers** is every consumer that walks
+`network_->getNodes()` and acts on what it finds *without reordering it*: the
+eligibility scan at `src/dpl/src/Place.cpp:L366-L380`, `Opendp::prePlace`
+(`src/dpl/src/Place.cpp:L123-L125`), which seeds cells sitting across a region
+edge, the pixel painters `Opendp::setFixedGridCells`
+(`src/dpl/src/Opendp.cpp:L504`) and `Opendp::setInitialGridCells`
+(`src/dpl/src/Opendp.cpp:L432`), the verifier's two loops at
+`src/dpl/src/CheckPlacement.cpp:L46` and `src/dpl/src/CheckPlacement.cpp:L92`,
+whose earlier verdicts change what later checks see, the displacement statistics
+(`src/dpl/src/Opendp.cpp:L298`) and the write-back to the database
+(`src/dpl/src/Opendp.cpp:L242`), which accumulate and report over the container in
+order. `Opendp::refine` (`src/dpl/src/Place.cpp:L602-L607`) also walks it, though
+it then re-sorts and is annotated as not called
+(`src/dpl/src/Place.cpp:L601`).
+
+**Why `stable_sort` rather than `sort`** here, when the key is unique and cannot
+tie: it is defensive. Unique names cannot compare equal, but if they ever did the
+incoming order would still decide the outcome rather than the sort implementation.
 
 The guarantee is a property of that container and of nothing else. Passes that
 reach their cells through a fence region instead — `Opendp::prePlaceGroups`
-(`src/dpl/src/Place.cpp:L209`), `Opendp::placeGroups2`
-(`src/dpl/src/Place.cpp:L444`), and the three group-local sorts — iterate
+(`src/dpl/src/Place.cpp:L206-L209`), `Opendp::placeGroups2`
+(`src/dpl/src/Place.cpp:L439-L444`), and the three group-local sorts — iterate
 `group->getCells()`, whose order comes from elsewhere and is inventoried in the
-subsection on secondary orderings below. `placeGroups2` is unaffected because
-it re-sorts with the total `CellPlaceOrderLess` comparator
-(`src/dpl/src/Place.cpp:L449`) before using the result.
+subsection on secondary orderings below. `Opendp::placeGroups2`
+(`src/dpl/src/Place.cpp:L444`) reaches its cells the same way but is unaffected,
+because it re-sorts with the total `CellPlaceOrderLess` comparator
+(`src/dpl/src/Place.cpp:L449`) before using the result — guarantee A again.
 
 Rows are given comparable treatment during architecture post-processing, but by
 **two** sorts rather than one, and it is the second that fixes the row indices
@@ -876,9 +1087,22 @@ while (r < rows_.size()
        && abs(rows_[r]->getBottom() - subrows[0]->getBottom()) == 0) {
 ```
 
-— `src/dpl/src/infrastructure/architecture.cxx:L132-L133`. At this stage it is the
-choice of `stable_sort` rather than key uniqueness that makes the result
-reproducible: rows sharing a bottom keep the relative order they arrived in.
+— `src/dpl/src/infrastructure/architecture.cxx:L132-L133`. Be careful about what
+the `stable_sort` at `src/dpl/src/infrastructure/architecture.cxx:L115` does and
+does not achieve at this stage. Its **purpose is grouping**: it brings rows sharing
+a bottom coordinate next to each other so the `while` loop above can collect each
+run in one sweep. Stability then preserves whatever relative order those
+equal-bottom rows arrived in — and that is all it does. It does not make an
+unspecified incoming order specified. Rows are created by
+`Architecture::createAndAddRow` (`src/dpl/src/infrastructure/architecture.h:L34`)
+while the database's rows are walked, so if that walk order varied, a stable sort
+would faithfully preserve the variation rather than remove it. Nothing at this
+point in the function establishes reproducibility.
+
+What makes the *result* well defined is the merge, not the sort. Every run of
+equal-bottom rows is collapsed into one row, so after the merge no two rows share a
+bottom and the ordering has no ties left to break — as the next two paragraphs
+describe.
 
 Each sub-row set is then collapsed into a single row spanning the union of its
 intervals, with the surplus `Row` objects deleted
@@ -892,14 +1116,14 @@ The second sort, under `// Sort rows (to be safe).`
 vector by bottom coordinate
 (`src/dpl/src/infrastructure/architecture.cxx:L213`), and only afterwards are row
 identifiers assigned, under `// Assign row ids.`, as `rows_[r]->setId(r)`
-(`src/dpl/src/infrastructure/architecture.cxx:L214-L216`). Because the merge
+(`src/dpl/src/infrastructure/architecture.cxx:L214-L217`). Because the merge
 leaves exactly one row per distinct bottom, this final ordering has no ties left
 to break: the row indices the grid and the search metric depend on are a function
 of geometry rather than of database order.
 
-Two things on the default path are **not** covered by this chain — one container
-whose iteration order is pointer-derived, and three secondary sorts whose keys can
-tie under a non-stable sort. Both are described in
+Two things on the default path are covered by **neither** guarantee — one
+container whose iteration order is pointer-derived, and three secondary sorts
+whose keys can tie under a non-stable sort. Both are described in
 [Known Gotchas, Determinism, and Limitations](#known-gotchas-determinism-and-limitations).
 
 ### Secondary Orderings
@@ -912,16 +1136,16 @@ exactly where reproducibility is lost — as it is at
 
 | Ordering site | Location | Keys, in evaluation order | Final tie-breaker |
 |---|---|---|---|
-| `CellPlaceOrderLess` | sort applied at `Place.cpp:L381` and `Place.cpp:L449`; comparator `Place.cpp:L299-L319` | multi-row first; larger area first; smaller `centerDist` first; ascending instance name | instance name — unique, so a strict total order |
-| `PQ_entry` frontier | `Place.cpp:L885-L889` | smaller `calcDist` from the search origin first; smaller sequence number first | insertion sequence — first-in, first-out among equal distances |
-| `brickPlace1` | sort `Place.cpp:L485-L487`; function `Place.cpp:L480` | ascending `rectDist` to the fence-region bounding box | **none**, and the sort is not stable — recorded as item 2 of *Known Gotchas, Determinism, and Limitations* |
-| `brickPlace2` | sort `Place.cpp:L539-L542`; function `Place.cpp:L535` | ascending `rectDist` to the cell's own region rectangle | **none**, same as above |
-| `groupRefine` | sort `Place.cpp:L564-L566`; function `Place.cpp:L560` | descending `Opendp::disp`, i.e. displacement from the original position | **none**, same as above |
-| `refine` | sort `Place.cpp:L615-L617`; function `Place.cpp:L602` | descending `Opendp::disp` | none — but the function is annotated `// Not called -cherry.` at `Place.cpp:L601`, so it is not reached on the default path |
-| network construction | `dbToOpendp.cpp:L259-L260` | ascending instance name, **stable** | name is unique — founds all downstream reproducibility |
-| row post-processing | pre-merge sort `architecture.cxx:L115`; the sort that fixes row indices is the post-merge one at `architecture.cxx:L212-L213`, immediately before ids are assigned at `L214-L216` | ascending row bottom coordinate, **stable** | none — bottoms are **not** unique at `L115`, since co-linear sub-rows share one (`architecture.cxx:L102-L107`, `L132-L133`) and the stable sort is what keeps them in their incoming order; they are merged at `L171-L184`, so only the post-merge vector has one row per distinct bottom |
-| negotiation row order | `NegotiationLegalizer.cpp:L1196-L1201`, re-sorted per row at `L1224-L1225` | ascending y, then ascending x | none |
-| negotiation pass order | `NegotiationLegalizerPass.cpp:L728-L738` | descending overuse; ascending height; ascending width | **none** — recorded as D8 of *Known Gotchas, Determinism, and Limitations* |
+| `CellPlaceOrderLess` | sort applied at `src/dpl/src/Place.cpp:L381` and `src/dpl/src/Place.cpp:L449`; comparator `src/dpl/src/Place.cpp:L299-L319` | multi-row first; larger area first; smaller `centerDist` first; ascending instance name | instance name — unique, so a strict total order |
+| `PQ_entry` frontier | `src/dpl/src/Place.cpp:L885-L889` | smaller `calcDist` from the search origin first; smaller sequence number first | insertion sequence — first-in, first-out among equal distances |
+| `brickPlace1` | sort `src/dpl/src/Place.cpp:L485-L487`; function `src/dpl/src/Place.cpp:L480` | ascending `rectDist` to the fence-region bounding box | **none**, and the sort is not stable — recorded as item 2 of *Known Gotchas, Determinism, and Limitations* |
+| `brickPlace2` | sort `src/dpl/src/Place.cpp:L539-L542`; function `src/dpl/src/Place.cpp:L535` | ascending `rectDist` to the cell's own region rectangle | **none**, same as above |
+| `groupRefine` | sort `src/dpl/src/Place.cpp:L564-L566`; function `src/dpl/src/Place.cpp:L560` | descending `Opendp::disp`, i.e. displacement from the original position | **none**, same as above |
+| `refine` | sort `src/dpl/src/Place.cpp:L615-L617`; function `src/dpl/src/Place.cpp:L602` | descending `Opendp::disp` | none — but the function is annotated `// Not called -cherry.` at `src/dpl/src/Place.cpp:L601`, so it is not reached on the default path |
+| network construction | `src/dpl/src/dbToOpendp.cpp:L259-L260` | ascending instance name, **stable** | name is unique. This is **Guarantee B** and its scope is the un-reordered traversals of `network_->getNodes()`; the sorted placement pass above does **not** depend on it |
+| row post-processing | pre-merge sort `src/dpl/src/infrastructure/architecture.cxx:L115`; the sort that fixes row indices is the post-merge one at `src/dpl/src/infrastructure/architecture.cxx:L213`, immediately before ids are assigned at `L214-L217` | ascending row bottom coordinate, **stable** in both | none at `L115` — bottoms are **not** unique there, since co-linear sub-rows share one (`src/dpl/src/infrastructure/architecture.cxx:L102-L107`, `L132-L133`). The pre-merge sort's job is **grouping**, so the run-collecting loop can sweep each set once; stability only preserves the incoming order and establishes nothing on its own. The merge at `L171-L184` leaves one row per distinct bottom, so the post-merge sort has no ties left |
+| negotiation row order | `src/dpl/src/NegotiationLegalizer.cpp:L1196-L1201`, re-sorted per row at `L1224-L1225` | ascending y, then ascending x | none |
+| negotiation pass order | `src/dpl/src/NegotiationLegalizerPass.cpp:L728-L738` | descending overuse; ascending height; ascending width | **none** — recorded as D8 of *Known Gotchas, Determinism, and Limitations* |
 
 Three of those rows deserve stating plainly, because the guarantee that holds for
 `CellPlaceOrderLess` does **not** extend to them. `brickPlace1`, `brickPlace2` and
@@ -982,8 +1206,13 @@ The search is a **best-first / uniform-cost (Dijkstra-like) search over a metric
 space**, not a breadth-first traversal — `Opendp::diamondSearch`
 (`src/dpl/src/Place.cpp:L839-L933`), and specifically
 `src/dpl/src/Place.cpp:L891-L892` and `src/dpl/src/Place.cpp:L927-L929`. Two
-pieces of evidence in the source establish this, and either one alone would be
-sufficient.
+pieces of evidence in the source establish it, and they are needed **together**:
+the container fixes that candidates are drawn in key order rather than in
+insertion order, and the key fixes that the ordering key is origin distance rather
+than an accumulated path cost or a hop count. Neither fact settles the
+classification without the other — a priority queue keyed on hop count would sweep
+in breadth-first order, and a distance value pushed into a FIFO queue would be
+popped in insertion order and never consulted.
 
 **First, the frontier is a min-heap, not a FIFO queue.**
 
@@ -1190,7 +1419,7 @@ and conflating them makes any description of the algorithm wrong. Every mention 
 |---|---|---|---|---|
 | `Opendp::calcDist` | `src/dpl/src/Place.cpp:L935-L940` | database units | **X scaled by site width; Y resolved through the row table** | the search frontier's priority key |
 | `CellPlaceOrderLess::centerDist` | `src/dpl/src/Place.cpp:L293-L297` | database units | **none** | the third cell-ordering key (measured from the cell's lower-left corner to the core centre) |
-| `Opendp::disp` | `src/dpl/src/Opendp.cpp:L387-L391` | database units | **none** | displacement statistics and the refinement sorts (measured from the **original** position) |
+| `Opendp::disp` | `src/dpl/src/Opendp.cpp:L387-L391` | database units | **none** | displacement statistics and the refinement sorts (measured from the **original** position on the default path — see [Reporting and statistics](#reporting-and-statistics)) |
 | Negotiation greedy-improvement measure | `src/dpl/src/NegotiationLegalizerPass.cpp:L789` | **grid indices** | **none** | the opt-in engine's greedy improvement pass |
 
 A fifth, related quantity is `Opendp::distChange`
@@ -1230,7 +1459,7 @@ The citations below use that real path so they resolve directly with
 | `test/Nangate45/Nangate45.lef:L772-L776` — `SITE FreePDK45_38x28_10R_NP_162NW_34O`, with `SYMMETRY y ;` at `L773` and `CLASS core ;` at `L774` | `SIZE 0.19 BY 1.4 ;` at `L775` | **site width = 0.19 × 2000 = 380 database units**; **row height = 1.4 × 2000 = 2800 database units** |
 | `src/dpl/test/simple01.def:L5` | `UNITS DISTANCE MICRONS 2000 ;` | consistent with the LEF |
 | `src/dpl/test/simple01.def:L7` | `ROW ROW_0 FreePDK45_38x28_10R_NP_162NW_34O 3800 2800 FS DO 32 BY 1 STEP 380 0 ;` | `STEP 380` corroborates the site width |
-| `src/dpl/test/simple01.def:L7-L10` | ROW_0 at y = 2800 `FS`, ROW_1 at y = 5600 `N`, ROW_2 at y = 8400 `FS`, ROW_3 at y = 11200 `N` | row pitch of 2800 database units corroborates the row height; the alternating `FS`/`N` orientations ground the orientation and power-rail parity constraint directly in the corpus |
+| `src/dpl/test/simple01.def:L7-L10` | ROW_0 at y = 2800 `FS`, ROW_1 at y = 5600 `N`, ROW_2 at y = 8400 `FS`, ROW_3 at y = 11200 `N` | row pitch of 2800 database units corroborates the row height; the `FS`/`N` sequence is this design's own row data, and the module reads each row's declared orientation rather than deriving a pattern from it — see [The Legality Predicate Chain](#the-legality-predicate-chain) |
 | `src/dpl/test/simple01.tcl:L3-L4` | `read_lef Nangate45/Nangate45.lef` at `L3`, followed by `read_def simple01.def` at `L4` | the test genuinely reads this technology |
 
 **The worked example.** Substituting those corpus values into the two terms of the
@@ -1240,20 +1469,46 @@ technology, both derived from `SIZE 0.19 BY 1.4 ;`
 (`test/Nangate45/Nangate45.lef:L775`). The ratio is **2800 / 380 = 7.368…**. The
 three statements that follow are arithmetic on those two numbers:
 
-- **7 sites** of horizontal travel cost 7 × 380 = **2660** database units
-  (`src/dpl/src/Place.cpp:L938`) and are popped **before** the adjacent row, which
-  costs **2800** (`src/dpl/src/Place.cpp:L937`), because the heap pops in ascending
-  `manhattan_distance` (`src/dpl/src/Place.cpp:L885-L889`).
-- **8 sites** of horizontal travel cost 8 × 380 = **3040** database units
-  (`src/dpl/src/Place.cpp:L938`) and are popped **after** the adjacent row, by that
-  same ordering (`src/dpl/src/Place.cpp:L885-L889`).
+- A point **7 sites** away horizontally has key 7 × 380 = **2660** database units
+  (`src/dpl/src/Place.cpp:L938`), which is *less* than the **2800** of the point
+  one row away (`src/dpl/src/Place.cpp:L937`).
+- A point **8 sites** away horizontally has key 8 × 380 = **3040**
+  (`src/dpl/src/Place.cpp:L938`), which is *greater* than 2800.
 
-Because the frontier is popped in key order (`src/dpl/src/Place.cpp:L905-L906`) and
-the key is the distance from the origin (`src/dpl/src/Place.cpp:L927-L929`), the
-search consequently fans out roughly **7 sites** to the left and to the right of
-the origin before it will even consider the row immediately above or below: the
-expansion offers all four neighbours (`src/dpl/src/Place.cpp:L900-L903`), but the
-heap key decides which is examined first (`src/dpl/src/Place.cpp:L885-L889`).
+Read those two lines as a statement about **relative candidate ordering** and
+nothing more. Because the heap pops in ascending `manhattan_distance`
+(`src/dpl/src/Place.cpp:L885-L889`, popped at `src/dpl/src/Place.cpp:L905-L906`)
+and each push carries the exact origin distance
+(`src/dpl/src/Place.cpp:L927-L929`), *if* both points are enqueued and *if* the loop
+reaches both, the point 7 sites out is examined before the point one row up, and
+the point 8 sites out after it.
+
+Both conditions are real, so the ratio does **not** promise that any particular
+search actually visits seven sites before changing row:
+
+- **The loop can stop first.** `diamondSearch` returns the moment a popped
+  candidate passes `canBePlaced` (`src/dpl/src/Place.cpp:L907-L911`). If the origin
+  itself is legal, or the first site to either side is, no further candidate is
+  ever examined and the ratio never comes into play.
+- **A candidate can be out of bounds.** Every push is guarded by the window test
+  `if (neighbor.x < x_min || neighbor.x > x_max || neighbor.y < y_min || neighbor.y
+  > y_max) { continue; }` (`src/dpl/src/Place.cpp:L921-L924`), against bounds that
+  were derived from the displacement limits
+  (`src/dpl/src/Place.cpp:L844-L847`), narrowed to the cell's fence region if it has
+  one (`src/dpl/src/Place.cpp:L849-L860`), and clipped to the grid
+  (`src/dpl/src/Place.cpp:L862-L866`). A cell near the left or right edge of the
+  core, a cell in a narrow fence region, or any cell run with a small
+  `-max_displacement` in `x`, will simply have no seventh site to enqueue — while
+  the row above may still be inside the window.
+- **A candidate can already be closed.** Neighbours are marked visited at *enqueue*
+  time (`src/dpl/src/Place.cpp:L926`), so a point reached by one expansion is never
+  enqueued again by another.
+
+What the ratio does describe reliably is the **shape of the key function**: the
+expansion always offers all four neighbours (`src/dpl/src/Place.cpp:L900-L903`), and
+whenever the choice between them is genuinely open, the key
+(`src/dpl/src/Place.cpp:L885-L889`) resolves it in favour of horizontal travel until
+roughly seven sites of it have accumulated.
 
 **The behavioural consequence.** The equal-cost contour is a true diamond **only
 in database-unit space** (`src/dpl/src/Place.cpp:L935-L940`). In grid-index space —
@@ -1384,13 +1639,13 @@ predicate and enforces **seven** stages:
 
 | # | Stage | Location | Rejects when |
 |---|---|---|---|
-| 1 | Right-edge bound | `Place.cpp:L1015-L1017` | the cell's right edge exceeds `grid_->getRowSiteCount()` |
-| 2 | Region containment | `Place.cpp:L1018-L1020` | `checkRegionOverlap` fails — an R-tree query, described in [Fence Region (Group) Handling](#fence-region-group-handling) |
-| 3 | Per-pixel scan | `Place.cpp:L1023-L1034` | any of six independent conditions holds at any pixel |
-| 4 | One-site-gap probe (optional) | `Place.cpp:L1036-L1082` | a one-site hole would be created, when `disallow_one_site_gaps_` is set |
-| 5 | Master symmetry | `Place.cpp:L1084-L1091` | the master's symmetry does not admit the site's orientation |
-| 6 | Multi-row power-rail parity | `Place.cpp:L1096-L1098` | a multi-row cell would land on the wrong rail parity |
-| 7 | Design-rule check | `Place.cpp:L1100` | `drc_engine_->checkDRC` fails |
+| 1 | Right-edge bound | `src/dpl/src/Place.cpp:L1015-L1017` | the cell's right edge exceeds `grid_->getRowSiteCount()` |
+| 2 | Region containment | `src/dpl/src/Place.cpp:L1018-L1020` | `checkRegionOverlap` fails — an R-tree query, described in [Fence Region (Group) Handling](#fence-region-group-handling) |
+| 3 | Per-pixel scan | `src/dpl/src/Place.cpp:L1023-L1034` | any of six independent conditions holds at any pixel |
+| 4 | One-site-gap probe (optional) | `src/dpl/src/Place.cpp:L1036-L1082` | a one-site hole would be created, when `disallow_one_site_gaps_` is set |
+| 5 | Master symmetry | `src/dpl/src/Place.cpp:L1084-L1091` | the master's symmetry does not admit the site's orientation |
+| 6 | Multi-row power-rail parity | `src/dpl/src/Place.cpp:L1096-L1098` | a multi-row cell would land on the wrong rail parity |
+| 7 | Design-rule check | `src/dpl/src/Place.cpp:L1100` | `drc_engine_->checkDRC` fails |
 
 **Stage 3 in detail.** The scan walks the cell's rows outermost and its sites
 innermost (`src/dpl/src/Place.cpp:L1023-L1025`), tracking whether it is on the
@@ -1413,7 +1668,10 @@ conditions, all evaluated in one composite test at
    `src/dpl/src/infrastructure/Grid.cpp:L263`).
 
 **Stage 4 in detail.** The gate is `if (disallow_one_site_gaps_) {`
-(`src/dpl/src/Place.cpp:L1036`), and the source explains the strategy in four
+(`src/dpl/src/Place.cpp:L1036`) — a member derived from the cell library, not set by
+the deprecated command-line flag of the same name, as
+[The one-site-gap setting](#the-one-site-gap-setting) sets out — and the source
+explains the strategy in four
 lines (`src/dpl/src/Place.cpp:L1037-L1040`): abutment is checked first, because an
 abutting cell is fine, and only when there is no abutting cell are cells at one or
 more sites' distance examined — and only on the left and right sides. The probe
@@ -1424,25 +1682,75 @@ values minus one.
 
 **Stages 5 and 6 in detail — orientation and power-rail parity are legality, not
 style.** In a standard cell library the power and ground rails run along the
-cell's top and bottom edges, and the rails must line up with the design's power
-distribution network. Consecutive rows therefore admit opposite cell
-orientations, which is directly visible in the corpus: the four rows of
-`src/dpl/test/simple01.def:L7-L10` alternate `FS`, `N`, `FS`, `N`. A cell placed
-in the wrong parity would abut ground to power.
+cell's top and bottom edges and must line up with the design's power distribution
+network, so the orientation a cell lands in is a correctness question rather than
+a cosmetic one.
 
-The predicate enforces this in two places. For every cell the bottom-row
+**The landing orientation is per-row database data, not a rule the module
+derives.** `Grid::markHopeless` walks the block's rows and records each row's site
+together with that row's own orientation in an interval map:
+
+```cpp
+row_sites_[y_row.v].add(
+    {{x_start.v, x_end.v}, {{db_row->getSite(), db_row->getOrient()}}});
+```
+
+— `src/dpl/src/infrastructure/Grid.cpp:L122-L123`, under
+`// Fragmented row support; mark valid sites.`
+(`src/dpl/src/infrastructure/Grid.cpp:L111`). `Grid::getSiteOrientation`
+(`src/dpl/src/infrastructure/Grid.cpp:L263-L279`) reads it back, and it takes a
+site as a parameter because one grid row can offer more than one: the container is
+`boost::icl::interval_map<int, SiteToOrientation, ...>`
+(`src/dpl/src/infrastructure/Grid.h:L197-L198`) whose value type is
+`std::map<odb::dbSite*, odb::dbOrientType>`
+(`src/dpl/src/infrastructure/Grid.h:L179`). A lookup that finds no interval, or an
+interval that does not offer the cell's own site, yields an empty optional
+(`src/dpl/src/infrastructure/Grid.cpp:L268-L269` and
+`src/dpl/src/infrastructure/Grid.cpp:L274-L278`) — which is rejection condition 6
+of stage 3 above.
+
+**Alternation is a property of a particular design, not something the module
+assumes.** Rows in the regression corpus commonly do alternate: the four rows of
+`src/dpl/test/simple01.def:L7-L10` run `FS`, `N`, `FS`, `N`. But the corpus also
+holds designs that do not. The single-height rows of
+`src/dpl/test/multi_height1-opt.def:L7-L12` run `N` at the origin and then `FS`
+five times over — five consecutive rows sharing one orientation. And in
+`src/dpl/test/regions3.def:L8-L10` two rows of different site types share the same
+origin, `FS` on the single-height site and `N` on `DoubleHeightSite`, so one grid
+row offers two different orientations depending on which site the cell needs.
+Nothing in the predicate infers parity from a row index; it asks the row what it
+holds.
+
+The predicate enforces the constraint in two places. For every cell the bottom-row
 orientation is resolved with
 `const auto orient = grid_->getSiteOrientation(x, y, site).value();`
-(`src/dpl/src/Place.cpp:L1084`) and, under the pre-existing comment
-`// Check for symmetry` (`src/dpl/src/Place.cpp:L1086`), the master's declared
-symmetry is fetched with `dpl::DetailedOrient::getMasterSymmetry`
+(`src/dpl/src/Place.cpp:L1084`), where `site` is the cell's own
+(`src/dpl/src/Place.cpp:L1022`). Under the pre-existing comment
+`// Check for symmetry` (`src/dpl/src/Place.cpp:L1086`) the declared symmetry is
+fetched with `dpl::DetailedOrient::getMasterSymmetry`
 (`src/dpl/src/Place.cpp:L1088`) and tested against that orientation by
 `checkMasterSym` (`src/dpl/src/Place.cpp:L1089`; the function is at
 `src/dpl/src/Place.cpp:L1113-L1135`, a switch over `dbOrientType` in which `R0`
 is always admissible and every mirrored or rotated form requires the
-corresponding symmetry bit). The corpus site declares `SYMMETRY y ;`
-(`test/Nangate45/Nangate45.lef:L773`), which is what admits the mirrored
-placements the alternating rows require.
+corresponding symmetry bit).
+
+The admission rule is therefore the **master's** declared symmetry, not the
+site's. `getMasterSymmetry` reads `master->getSymmetryX()`,
+`master->getSymmetryY()` and `master->getSymmetryR90()` into the `Symmetry_X`,
+`Symmetry_Y` and `Symmetry_ROT90` bits
+(`src/dpl/src/optimization/detailed_orient.cxx:L503-L516`; the bit values are at
+`src/dpl/src/util/symmetry.h:L9-L11`), and `checkMasterSym` tests nothing else —
+its switch has one case per orientation and every mirrored or rotated case
+reduces to a bit test (`src/dpl/src/Place.cpp:L1120-L1131`). The site's own
+`SYMMETRY` statement is not consulted by this stage. In the corpus that works
+out as follows: an `FS` row resolves to the `MX` orientation
+(`src/odb/src/db/dbTypes.cpp:L53-L54`), the `MX` case requires the `Symmetry_X`
+bit (`src/dpl/src/Place.cpp:L1119-L1120`), and every corpus master declares
+`SYMMETRY X Y ;` — the first at `test/Nangate45/Nangate45.lef:L783` — so the bit
+is present and the placement is admitted. A master declaring no symmetry would be
+rejected in that row while remaining admissible in an `N` row, which resolves to
+`R0` (`src/odb/src/db/dbTypes.cpp:L41-L42`) and is accepted unconditionally
+(`src/dpl/src/Place.cpp:L1117-L1118`).
 
 For multi-row cells the bottom-row test is not enough, and the source says so in
 three lines (`src/dpl/src/Place.cpp:L1093-L1095`): the bottom-row site and
@@ -1509,15 +1817,26 @@ A search can fail: `Opendp::diamondSearch` returns a default-constructed
 (`src/dpl/src/Place.cpp:L394-L404`) and two repair mechanisms —
 `Opendp::moveHopeless` (`src/dpl/src/Place.cpp:L1204`) and
 `Opendp::nearestBlockEdge` (`src/dpl/src/Place.cpp:L1168`) — and beyond those it
-reports failure rather than producing an illegal placement
-(`src/dpl/src/Opendp.cpp:L191-L205`).
+reports the failure and terminates the run (`src/dpl/src/Opendp.cpp:L191-L205`).
+
+Terminating is not the same as declining to write. The write-back happens
+*first*: `updateDbInstLocations();` runs at `src/dpl/src/Opendp.cpp:L190` and the
+failure vector is not examined until `src/dpl/src/Opendp.cpp:L191`, so whatever
+placement the legalizer did achieve — including the cells it could not legalize,
+left wherever they were — is already in OpenDB by the time `DPL 36` is raised at
+`src/dpl/src/Opendp.cpp:L204`. What the escalation buys is that the run stops
+rather than continuing downstream on a placement known to be illegal; it does not
+protect the database from the partial result.
 
 ### diamondMove — the direct attempt
 
 `Opendp::diamondMove` has two overloads. The one-argument form
-(`src/dpl/src/Place.cpp:L633-L637`) derives the starting grid point from the
-cell's own legalized position — `const GridPt init = legalGridPt(cell, false);`
-(`src/dpl/src/Place.cpp:L635`) — and forwards to the two-argument form. The
+(`src/dpl/src/Place.cpp:L633-L637`) derives the starting grid point from the cell's
+**original** position, legalized — `const GridPt init = legalGridPt(cell, false);`
+(`src/dpl/src/Place.cpp:L635`), which resolves through
+`initialLocation` (`src/dpl/src/Place.cpp:L1373`) to the OpenDB instance location
+snapped into the core and onto a site and a row
+(`src/dpl/src/Place.cpp:L1366-L1381`) — and forwards to the two-argument form. The
 two-argument form (`src/dpl/src/Place.cpp:L639-L670`) logs the intent
 (`src/dpl/src/Place.cpp:L641-L650`), runs
 `const PixelPt pixel_pt = diamondSearch(cell, grid_pt.x, grid_pt.y);`
@@ -1584,40 +1903,57 @@ carried forward as an observed characteristic in
 ### The three phases
 
 Having chosen a neighbourhood, the routine runs three phases, each separated by a
-`deepIterativePause` observation point (`src/dpl/src/Place.cpp:L672-L680`) that is
-inert unless the deep-iterative debug observer is installed.
+`deepIterativePause` observation point (`src/dpl/src/Place.cpp:L672-L680`). That
+helper requires **both** debug conditions at once —
+`if (deep_iterative_debug_ && debug_observer_) {`
+(`src/dpl/src/Place.cpp:L674`) — so it is inert unless the deep-iterative flag is
+set *and* an observer is installed, and an observer only exists when the GUI is
+active (`src/dpl/src/Opendp.i:L116-L120`).
 
 1. **Unplace.** Under `// erase region cells`
    (`src/dpl/src/Place.cpp:L709`), a subset of the collected neighbours is
    unplaced —
    `if (target_cell->inGroup() == around_cell->inGroup()) { unplaceCell(around_cell); }`
-   (`src/dpl/src/Place.cpp:L710-L714`). What that test compares deserves stating
-   exactly, because it is easy to read as more than it is. `Node::inGroup` returns
-   `group_ != nullptr` (`src/dpl/src/infrastructure/Objects.cpp:L255-L258`), so the
-   condition is an equality of two **booleans**, not of two group identities. It
-   holds in two cases: both cells are grouped, or neither is. Two cells belonging
-   to *different* fence regions are both grouped, so they satisfy it. The
-   consequences are asymmetric:
-   - When the target is ungrouped, every grouped neighbour is skipped and left
-     placed. In that direction the test does keep the rip-up out of fence regions.
-   - When the target is grouped, every non-fixed grouped neighbour in the window is
-     evicted, **including one belonging to a different region**. The window is up
-     to 4 padded cell widths wide by 3 rows tall on each side
-     (`src/dpl/src/Place.cpp:L690-L695`), so it can straddle a region boundary.
+   (`src/dpl/src/Place.cpp:L710-L714`). The condition is written to handle either
+   kind of target, but only one kind reaches this routine, so establishing which
+   one comes first.
+
+   **Every target is ungrouped.** `Opendp::ripUpAndReplace` has exactly one call
+   site anywhere in the module — `rip_up_move = ripUpAndReplace(cell);`
+   (`src/dpl/src/Place.cpp:L400`) — and it sits inside the general pass's loop over
+   `sorted_cells` (`src/dpl/src/Place.cpp:L384`). A cell enters that vector only if
+   it passes `if (!(cell->isFixed() || cell->inGroup() || cell->isPlaced()))`
+   (`src/dpl/src/Place.cpp:L371`), so `target_cell->inGroup()` is false on every
+   invocation. Grouped cells never take this path at all: they are placed by
+   `Opendp::placeGroups2` (`src/dpl/src/Place.cpp:L439-L477`), which calls
+   `diamondMove` (`src/dpl/src/Place.cpp:L455`) and, if any cell of a region fails,
+   unplaces that whole region (`src/dpl/src/Place.cpp:L462-L466`) and falls back to
+   `brickPlace1` or `brickPlace2` (`src/dpl/src/Place.cpp:L470-L474`) — never to
+   rip-up.
+
+   **What the test therefore does.** `Node::inGroup` returns `group_ != nullptr`
+   (`src/dpl/src/infrastructure/Objects.cpp:L255-L258`), so the condition is an
+   equality of two **booleans**, not of two group identities. With the left operand
+   always false it reduces to `!around_cell->inGroup()`: every non-fixed
+   **ungrouped** neighbour in the window is evicted, and every **grouped**
+   neighbour is skipped and left exactly where it was. The reachable behaviour is
+   therefore simple — a rip-up on this path never removes a cell from a fence
+   region, so it never crosses a region boundary and region containment is not at
+   stake here. Containment is enforced where grouped cells are actually placed, by
+   the group-narrowed search bounds (`src/dpl/src/Place.cpp:L849-L860`) and by the
+   region conditions of the legality predicate
+   (`src/dpl/src/Place.cpp:L1028-L1029` and `src/dpl/src/Place.cpp:L997`).
+
+   The other half of the boolean — a grouped target evicting grouped neighbours,
+   which would include one belonging to a *different* region, since two cells in
+   different regions are both grouped and so satisfy the equality — is unreachable
+   from the only caller and is recorded as **O3** in
+   [Recorded observations index](#recorded-observations-index) rather than described
+   here as behaviour.
 
    The same boolean filter is applied again in phase 3
    (`src/dpl/src/Place.cpp:L739-L740`), so the set evicted and the set re-placed
    are the same set.
-
-   What actually keeps an evicted cell inside its own region is not this test but
-   the search and the legality predicate that follow: a grouped cell's search
-   bounds are pulled inside its group's bounding box
-   (`src/dpl/src/Place.cpp:L849-L860`), `checkPixels` rejects any pixel whose owner
-   group differs from the cell's (`src/dpl/src/Place.cpp:L1028-L1029`), and
-   `checkRegionOverlap` requires the cell's box to be covered by its region
-   (`src/dpl/src/Place.cpp:L997`). A cell evicted from region A is therefore
-   re-placed in region A — by region enforcement downstream, not by the
-   group-membership test here.
 2. **Retry the target.** Under `// place target cell`
    (`src/dpl/src/Place.cpp:L718`), the target is searched again in the now-emptied
    neighbourhood: `if (!diamondMove(target_cell))`
@@ -1638,27 +1974,44 @@ inert unless the deep-iterative debug observer is installed.
 
 A rip-up can therefore *increase* the failure count — a consequence of the two
 `placement_failures_.push_back` sites cited above: one call may fail to place the
-target (`src/dpl/src/Place.cpp:L725`) and additionally fail to restore one or more
-of the neighbours it evicted (`src/dpl/src/Place.cpp:L745`).
+target (`src/dpl/src/Place.cpp:L725`) and additionally fail to reseat one or more
+of the neighbours it evicted (`src/dpl/src/Place.cpp:L745`). Reseating is a new
+search, not a restoration: nothing records where an evicted neighbour used to
+sit, so a neighbour that is placed again lands wherever its own search found
+room.
 
 ### Terminal failure reporting
 
 `Opendp::detailedPlacement` inspects `placement_failures_` after the legalizer
-returns (`src/dpl/src/Opendp.cpp:L191-L205`). If it is non-empty:
+returns *and after the statistics and the write-back have already run*: the
+dispatch order is `diamondDPL(); findDisplacementStats();
+updateDbInstLocations();` (`src/dpl/src/Opendp.cpp:L188-L190`) and only then
+`if (!placement_failures_.empty()) {` (`src/dpl/src/Opendp.cpp:L191`). If the
+vector is non-empty:
 
 - `DPL 34` reports the count —
   `"Detailed placement failed on the following {} instances:"`
   (`src/dpl/src/Opendp.cpp:L192-L195`).
 - `DPL 35` reports each failing instance name, one per line, with the format
   string `" {}"` (`src/dpl/src/Opendp.cpp:L197`).
-- The failures are persisted with
+- The failures are persisted as violation markers with
   `saveFailures({}, {}, {}, {}, {}, {}, {}, placement_failures_, {}, {})`
   (`src/dpl/src/Opendp.cpp:L200`) — the eighth argument being the only populated
-  one — and optionally serialized with `writeJsonReport`
-  (`src/dpl/src/Opendp.cpp:L202`) when a report file was requested.
+  one. `saveFailures` is unconditional; the JSON serialization is not. The
+  `writeJsonReport` call (`src/dpl/src/Opendp.cpp:L202`) sits inside
+  `if (!report_file_name.empty()) {` (`src/dpl/src/Opendp.cpp:L201-L203`), so a
+  run invoked without `-report_file_name` produces markers and log lines but no
+  JSON file.
 - `DPL 36` then terminates the run:
   `logger_->error(DPL, 36, "Detailed placement failed inside DPL.");`
   (`src/dpl/src/Opendp.cpp:L204`).
+
+Because the write-back at `src/dpl/src/Opendp.cpp:L190` precedes all of that,
+a `DPL 36` run has already published its positions to OpenDB. The error stops the
+flow; it does not roll the database back or withhold the partial result. Read
+together with the ordering above, the same fact explains why the displacement
+statistics on this path still use the pre-legalization baseline: they are computed
+at `src/dpl/src/Opendp.cpp:L189`, one line before the write.
 
 So when legalization fails, the identifiers to search for are **DPL 34** for the
 count, **DPL 35** for the instance names, and **DPL 36** for the error itself. A
@@ -1669,6 +2022,17 @@ cell that cannot fit in the core at all, per `Grid::cellFitsInCore`
 (`src/dpl/src/infrastructure/Grid.cpp:L691-L695`). The fence-region passes raise
 their own errors, **DPL 16** (`src/dpl/src/Place.cpp:L498`) and **DPL 17**
 (`src/dpl/src/Place.cpp:L554`).
+
+And the converse is worth stating explicitly, because it is the easiest thing in
+this module to over-read. An **empty** `placement_failures_` means only that no
+cell reached the end of `Opendp::place` without a site — that is, that
+`diamondMove` succeeded, or that `ripUpAndReplace` succeeded, for every eligible
+cell (`src/dpl/src/Place.cpp:L394-L403`). It is **not** a legality verdict.
+`Opendp::detailedPlacement` (`src/dpl/src/Opendp.cpp:L116-L240`) never calls
+`Opendp::checkPlacement`, so none of the nine checks in
+[The Legality Invariant](#the-legality-invariant) has been evaluated when the
+command returns quietly. Establishing that the result is legal requires issuing
+`check_placement` separately, as the reference flow does at `test/flow.tcl:L248`.
 
 ### Hopeless-start repair
 
@@ -1688,7 +2052,7 @@ inward by a safety margin before clearing the flag inside it
 flagged from which a legal site would in fact still have been inside the
 displacement limits; the limitations section below quantifies that margin.
 The flag is consulted only where an origin is chosen, here and in
-`Opendp::moveHopeless` (`src/dpl/src/Place.cpp:L1213-L1257`); neither
+`Opendp::moveHopeless` (`src/dpl/src/Place.cpp:L1204-L1257`); neither
 `Opendp::diamondSearch` nor `Opendp::checkPixels` reads it
 (`src/dpl/src/Place.cpp:L839-L933`, `src/dpl/src/Place.cpp:L1009-L1101`), so it
 never rules a candidate site out. Its effect is to divert the origin, and a
@@ -1720,13 +2084,19 @@ plain geometric snapper underneath, whose pre-existing three-line header reads
 (`src/dpl/src/Place.cpp:L1150-L1152`) and aligns to a row through the row table
 (`src/dpl/src/Place.cpp:L1153-L1157`). `Opendp::initialLocation`
 (`src/dpl/src/Place.cpp:L1349-L1359`) supplies the pre-legalization position,
-core-relative and optionally left-padded (`src/dpl/src/Place.cpp:L1354-L1356`).
+core-relative and optionally left-padded (`src/dpl/src/Place.cpp:L1354-L1356`). It
+reads that position from the **OpenDB instance**, not from the `Node`'s working
+coordinates — `cell->getDbInst()->getLocation(loc.x.v, loc.y.v);`
+(`src/dpl/src/Place.cpp:L1352`) — so throughout the legalizer it returns the
+global-placement position, unaffected by any move already committed, until
+`Opendp::updateDbInstLocations` (`src/dpl/src/Opendp.cpp:L242`) writes the results
+back after the pass finishes (`src/dpl/src/Opendp.cpp:L190`).
 The two `legalGridPt` overloads (`src/dpl/src/Place.cpp:L1162-L1166` and
 `src/dpl/src/Place.cpp:L1409-L1413`) convert either result to grid space, both
 using `gridX` for the horizontal axis and `gridSnapDownY` for the vertical
 (`src/dpl/src/Place.cpp:L1165` and `src/dpl/src/Place.cpp:L1412`).
 
-### Commit and undo
+### Commit and eviction
 
 `Opendp::placeCell` (`src/dpl/src/Place.cpp:L1420-L1439`) is the commit. It
 records the cell's prior state (`src/dpl/src/Place.cpp:L1422-L1424`), writes the
@@ -1746,20 +2116,66 @@ conversion that commit relies on: `cell->setLeft(gridToDbu(x, grid_->getSiteWidt
 lookup pairing that `calcDist` uses. `placeCell` follows it directly, with no
 blank line between them (`src/dpl/src/Place.cpp:L1419` is the closing brace).
 
-`Opendp::unplaceCell` (`src/dpl/src/Place.cpp:L1441-L1453`) is the undo. It
+`Opendp::unplaceCell` (`src/dpl/src/Place.cpp:L1441-L1453`) is the eviction. It
 returns immediately for a fixed or already-unplaced cell
 (`src/dpl/src/Place.cpp:L1443-L1445`), appends an `UnplaceCellAction` recording the
 hold flag if a journal is installed (`src/dpl/src/Place.cpp:L1446-L1449`), erases
 the cell from the grid with `grid_->erasePixel(cell)`
 (`src/dpl/src/Place.cpp:L1450`; the implementation is
 `src/dpl/src/infrastructure/Grid.cpp:L412`), and clears the placed and hold flags
-(`src/dpl/src/Place.cpp:L1451-L1452`). This pairing is what makes the rip-up
-window's eviction reversible.
+(`src/dpl/src/Place.cpp:L1451-L1452`).
 
-`Opendp::swapCells` (`src/dpl/src/Place.cpp:L756-L801`) and
-`Opendp::refineMove` (`src/dpl/src/Place.cpp:L803-L826`) are the other two
-consumers of the same commit/undo pair; both are used only by the fence-region
-refinement loop.
+**It is not an undo, and the distinction matters for reading the rip-up path.**
+Three different things are easy to conflate here:
+
+- **Eviction** — what `unplaceCell` does. It frees the cell's pixels and clears two
+  flags. It does **not** restore the cell's coordinates: `left_` and `bottom_`
+  retain whatever the last `setGridLoc` wrote
+  (`src/dpl/src/Place.cpp:L1417-L1418`), and no statement in the function touches
+  them (`src/dpl/src/Place.cpp:L1441-L1453`). An evicted cell is a cell holding no
+  site and a stale position, not a cell returned to an earlier state.
+- **Fresh re-placement** — what phase 3 of the rip-up does. Each evicted neighbour
+  is handed to `diamondMove` again (`src/dpl/src/Place.cpp:L740`), which derives a
+  start point from `legalGridPt(cell, false)` (`src/dpl/src/Place.cpp:L635`) and
+  runs a **new** search against the grid as it now stands
+  (`src/dpl/src/Place.cpp:L651`). That start point is not where the neighbour was
+  standing a moment ago: it comes from `initialLocation`
+  (`src/dpl/src/Place.cpp:L1373`), which reads the **OpenDB instance location**
+  (`src/dpl/src/Place.cpp:L1352`) — still the global-placement result at this point,
+  because legalized positions are written back to the database only after the
+  legalizer returns (`src/dpl/src/Opendp.cpp:L188-L190`). So the neighbour is
+  neither restored to its pre-eviction site nor replayed from a record; it is
+  searched for again from its original position, with no guarantee of landing where
+  it was — which is why a re-placement can fail and append to `placement_failures_`
+  (`src/dpl/src/Place.cpp:L745`).
+- **True undo** — `Journal::undo`, which rewinds recorded actions. It is reached in
+  exactly one place in the module, and not on this path: `Opendp::swapCells` builds
+  a journal local to itself (`src/dpl/src/Place.cpp:L767`), records both cells'
+  before-and-after coordinates (`src/dpl/src/Place.cpp:L768-L782`), performs the
+  swap, and calls `journal.undo()` (`src/dpl/src/Place.cpp:L797`) when the
+  post-swap design-rule check fails. The `placeCell` and `unplaceCell` journal
+  appends are instead guarded on the member `journal_`, which nothing in the
+  repository ever sets — see [Supporting Objects](#supporting-objects) — so along
+  the rip-up path no action is recorded and there is nothing to rewind.
+
+The rip-up is therefore not a transaction that rolls back on failure. It evicts a
+neighbourhood, re-searches the target, and re-searches each evicted neighbour from
+scratch; whichever of those searches fails leaves that cell unplaced and its name
+in `placement_failures_` (`src/dpl/src/Place.cpp:L725`,
+`src/dpl/src/Place.cpp:L745`).
+
+`Opendp::swapCells` (`src/dpl/src/Place.cpp:L756-L801`) and `Opendp::refineMove`
+(`src/dpl/src/Place.cpp:L803-L826`) are the other two consumers of the
+commit-and-evict pair, and both use it in the same shape — `unplaceCell` then
+`placeCell` at the new coordinates (`src/dpl/src/Place.cpp:L789-L792` and
+`src/dpl/src/Place.cpp:L820-L821`). `refineMove` is called from
+`Opendp::groupRefine` (`src/dpl/src/Place.cpp:L560`) at
+`src/dpl/src/Place.cpp:L572`, and from the uncalled `Opendp::refine`
+(`src/dpl/src/Place.cpp:L602`) at `src/dpl/src/Place.cpp:L623`; `swapCells` is
+called only from `Opendp::anneal` (`src/dpl/src/Place.cpp:L581`) at
+`src/dpl/src/Place.cpp:L594`. Both `groupRefine` and `anneal` run from the
+fence-region pass (`src/dpl/src/Place.cpp:L113-L114`), so neither is on the general
+legalization path.
 
 **D-6 — the ripUpAndReplace fallback.**
 
@@ -1768,11 +2184,12 @@ sequenceDiagram
     participant P as place() L321
     participant R as ripUpAndReplace L682
     participant G as Grid
+    participant M as diamondMove L633, L639
     participant S as diamondSearch L839
     participant F as placement_failures_
 
-    P->>P: diamondMove(cell) L394
-    Note over P: returned false
+    P->>M: diamondMove(cell) L394
+    M-->>P: false, bool
     P->>R: ripUpAndReplace(cell) L400
     R->>R: legalGridPt(target, padded) L684
     R->>R: boundary_margin = 3 rows L686
@@ -1780,25 +2197,34 @@ sequenceDiagram
     R->>G: scan window, gridPixel L690-L696
     G-->>R: occupying cells
     R->>R: collect non-fixed into pointer-ordered std::set L689, L699-L700
-    R->>G: unplaceCell where inGroup==inGroup, a bool test L710-L714
-    R->>S: diamondMove(target) L720
-    alt target placed
-        S-->>R: PixelPt with pixel
-    else target still fails
-        S-->>R: PixelPt with null pixel
+    R->>G: unplaceCell each ungrouped neighbour, erasePixel L710-L714
+    R->>M: diamondMove(target) L720
+    M->>S: diamondSearch(cell, x, y) L651
+    alt site found
+        S-->>M: PixelPt with pixel L909
+        M->>G: placeCell, paintPixel L663
+        M-->>R: true, bool L667
+    else frontier emptied
+        S-->>M: PixelPt with null pixel L932
+        M-->>R: false, bool L669
         R->>F: push_back(target) L725
         R->>R: success = false L726
     end
-    loop each region_cell L733, same bool guard L739
-        R->>S: diamondMove(neighbour) L740
+    loop each region_cell L733, same guard L739
+        R->>M: diamondMove(neighbour) L740
+        M->>S: diamondSearch(cell, x, y) L651
         alt re-placed
-            S-->>R: PixelPt with pixel
+            S-->>M: PixelPt with pixel L909
+            M->>G: placeCell, paintPixel L663
+            M-->>R: true, bool L667
         else cannot be re-placed
+            S-->>M: PixelPt with null pixel L932
+            M-->>R: false, bool L669
             R->>F: push_back(neighbour) L745
             R->>R: success = false L746
         end
     end
-    R-->>P: success L753
+    R-->>P: success, bool L753
     Note over P: failed_rip_up++ when false, L402
 ```
 
@@ -1830,7 +2256,12 @@ half-perimeter wirelength in `hpwl_before_`
 reports `DPL 1101` (`src/dpl/src/Opendp.cpp:L187`) and calls `diamondDPL()`
 (`src/dpl/src/Opendp.cpp:L188`).
 
-**D-2 — engine dispatch, both branches and both reporting paths.**
+**D-2 — engine dispatch, both branches and both reporting paths.** Read the
+default branch's exit node carefully: an empty `placement_failures_` means only
+that neither the direct move nor the rip-up recorded a failure. It is not a
+statement that the result satisfies
+[The Legality Invariant](#the-legality-invariant), because `detailedPlacement`
+never runs the verifier.
 
 ```mermaid
 flowchart TD
@@ -1841,15 +2272,20 @@ flowchart TD
     D --> E
     E --> F{"!use_negotiation_?<br/>L186"}
     F -->|yes, default| G["DPL 1101 diamond search<br/>L187"]
-    G --> H["diamondDPL, L188<br/>findDisplacementStats, L189<br/>updateDbInstLocations, L190"]
-    H --> I{"placement_failures_ empty?<br/>L191"}
-    I -->|yes| J["done, legal placement"]
-    I -->|no| K["DPL 34 count, L192-L195<br/>DPL 35 per instance, L197<br/>saveFailures, L200<br/>writeJsonReport, L202<br/>DPL 36 error, L204"]
+    G --> H["diamondDPL, L188<br/>findDisplacementStats, L189<br/>baseline still pre-legalization"]
+    H --> H2["updateDbInstLocations, L190<br/>DB WRITE-BACK happens here,<br/>before any failure is examined"]
+    H2 --> I{"placement_failures_ empty?<br/>L191"}
+    I -->|yes| J["no direct-placement or rip-up failure<br/>was recorded; detailedPlacement returns.<br/>This is NOT a legality verdict:<br/>nothing on this path calls checkPlacement"]
+    I -->|no| K["DPL 34 count, L192-L195<br/>DPL 35 per instance, L197<br/>saveFailures markers, L200"]
+    K --> K2{"report_file_name empty?<br/>L201"}
+    K2 -->|no| K3["writeJsonReport, L202"]
+    K2 -->|yes| K4["DPL 36 error, L204<br/>run stops; the partial<br/>placement is already in OpenDB"]
+    K3 --> K4
     F -->|no, optional| L["initGrid L207, setFixedGridCells L208<br/>region-guarded group pixels L211-L214<br/>DPL 1102, L215"]
-    L --> M["NegotiationLegalizer L217-L222<br/>setRunAbacus L223<br/>legalize L224, setDplPositions L225"]
+    L --> M["NegotiationLegalizer L217-L222<br/>setRunAbacus L223<br/>legalize L224: flushToDb ALREADY<br/>wrote the DB, NegotiationLegalizer.cpp:L306<br/>setDplPositions L225"]
     M --> N{"numViolations &gt; 0?<br/>L227"}
     N -->|yes| O["DPL 701 warning L228-L232<br/>metric NL__no__converge__final_violations<br/>L233-L234"]
-    N -->|no| P["findDisplacementStats L237<br/>updateDbInstLocations L238"]
+    N -->|no| P["findDisplacementStats L237<br/>baseline REBASED by the earlier write<br/>updateDbInstLocations L238"]
     O --> P
 ```
 
@@ -1940,9 +2376,24 @@ after every multi-row cell (`src/dpl/src/Place.cpp:L304-L306`); its rank among t
 remaining cells is set by area, then centre distance, then instance name
 (`src/dpl/src/Place.cpp:L312-L318`).
 
-**Branch not taken:** the iterative-debug reporting at
-`src/dpl/src/Place.cpp:L385-L392` and the per-move report lambda at
-`src/dpl/src/Place.cpp:L323-L360`, both inert without a debug observer.
+**Branches not taken — and they are gated on two *different* flags, which is easy
+to conflate.** Both are silent on our run, but for different reasons:
+
+- The per-cell progress line at `src/dpl/src/Place.cpp:L385-L392` is guarded by
+  `if (iterative_debug_) {` (`src/dpl/src/Place.cpp:L385`). That flag is set by
+  `Opendp::setIterativePlacement` (`src/dpl/src/Opendp.cpp:L93`), which the Tcl
+  layer calls **unconditionally** (`src/dpl/src/Opendp.i:L114`). It therefore does
+  **not** need an observer, and does not need the GUI: a headless run that asks
+  for iterative placement gets these lines.
+- The per-move `report_placement` lambda at `src/dpl/src/Place.cpp:L323-L360` is
+  guarded by `if (debug_observer_) {` (`src/dpl/src/Place.cpp:L325`) instead. The
+  observer is only ever installed through `Opendp::setDebug`
+  (`src/dpl/src/Opendp.cpp:L83`), and the Tcl layer constructs one **only when the
+  GUI is active** — `if (dpl::Graphics::guiActive()) {`
+  (`src/dpl/src/Opendp.i:L116-L120`). So this lambda, together with the
+  `deep_iterative_debug_` bookkeeping and the `redrawAndPause()` call it ends with
+  (`src/dpl/src/Place.cpp:L353-L358`), is unreachable in a headless run whatever
+  the iterative flag is set to.
 
 ### Step 4 — The direct move
 
@@ -1989,9 +2440,21 @@ overlapping. The test fails, so the four neighbours are enqueued
 `calcDist(center, neighbor)` (`src/dpl/src/Place.cpp:L927`).
 `Opendp::calcDist` (`src/dpl/src/Place.cpp:L935`) evaluates to 380 database units
 for each horizontal neighbour and 2800 for each vertical one, for the corpus
-technology. The two horizontal neighbours therefore both pop before either
-vertical one, and — since 7 × 380 = 2660 < 2800 — the search will reach seven
-sites out on each side before trying the adjacent row.
+technology. Given those keys, and provided all four are inside the window
+(`src/dpl/src/Place.cpp:L921-L924`), the two horizontal neighbours pop before either
+vertical one. Extending the same comparison, 7 × 380 = 2660 < 2800 < 8 × 380, so a
+candidate seven sites out ranks ahead of the adjacent row and one eight sites out
+ranks behind it.
+
+That is an ordering among candidates, not a prediction about this run. Two things
+can cut it short, and either is ordinary: the loop returns the instant any popped
+candidate passes `canBePlaced` (`src/dpl/src/Place.cpp:L907-L911`), so a legal site
+two sites out ends the search there; and the window test
+(`src/dpl/src/Place.cpp:L921-L924`) may exclude the seventh site while still
+admitting the adjacent row — for a cell near the core edge, or under a small
+`-max_displacement` in `x`. The ratio tells you which candidate wins *when both are
+available*, and nothing stronger. See
+[How the Two Axes Are Weighted](#how-the-two-axes-are-weighted).
 
 Each popped candidate goes through `canBePlaced`
 (`src/dpl/src/Place.cpp:L942`) → `checkPixels`
@@ -2002,9 +2465,15 @@ taken**: the multi-row power-parity stage at
 half of rejection condition 4 does not apply and condition 5 applies instead
 (`src/dpl/src/Place.cpp:L1028-L1029`); and `checkRegionOverlap`
 (`src/dpl/src/Place.cpp:L1018`) takes its no-region branch,
-`return result.empty();` (`src/dpl/src/Place.cpp:L1005`). Assuming the design does
-not set `disallow_one_site_gaps_`, **branch not taken**: the one-site-gap probe at
-`src/dpl/src/Place.cpp:L1036-L1082` is skipped.
+`return result.empty();` (`src/dpl/src/Place.cpp:L1005`). And `disallow_one_site_gaps_` is false for this
+library — `FILLCELL_X1` (`test/Nangate45/Nangate45.lef:L5761`) declares
+`SIZE 0.19 BY 1.4 ;` (`test/Nangate45/Nangate45.lef:L5766`), a width equal to the
+site width, so `odb::hasOneSiteMaster` returns true
+(`src/odb/src/db/util.cpp:L371-L373`) and the negation stored at
+`src/dpl/src/dbToOpendp.cpp:L177` is false — so **branch not taken**: the
+one-site-gap probe at `src/dpl/src/Place.cpp:L1036-L1082` is skipped. Note that this
+follows from the library, not from a command-line choice; see
+[The one-site-gap setting](#the-one-site-gap-setting).
 
 The first candidate that clears all seven stages causes an immediate return of
 `PixelPt(grid_->gridPixel(...), nearest.x, nearest.y)`
@@ -2020,8 +2489,10 @@ Back in `diamondMove`, `if (pixel_pt.pixel)` is true
 `src/dpl/src/infrastructure/Grid.cpp:L407`) marks the pixels occupied so the next
 cell's search will see them, the placed flag is set
 (`src/dpl/src/Place.cpp:L1427`), the orientation is taken from the site
-(`src/dpl/src/Place.cpp:L1428-L1429`), and a `MoveCellAction` is journalled if a
-journal exists (`src/dpl/src/Place.cpp:L1430-L1438`). `diamondMove` returns true
+(`src/dpl/src/Place.cpp:L1428-L1429`). The `MoveCellAction` append that follows
+(`src/dpl/src/Place.cpp:L1430-L1438`) is **branch not taken**: it is guarded on a
+journal having been installed, and nothing on this path installs one
+(`src/dpl/src/Opendp.cpp:L106`). `diamondMove` returns true
 (`src/dpl/src/Place.cpp:L667`).
 
 **Branch not taken — the rip-up escalation.** Because `diamond_move` is true,
@@ -2036,7 +2507,10 @@ After the loop, `place` reports its movement summary
 (`src/dpl/src/Place.cpp:L434-L435`). Control returns through `diamondDPL` to
 `detailedPlacement`, which computes displacement statistics with
 `findDisplacementStats()` (`src/dpl/src/Opendp.cpp:L189`;
-`src/dpl/src/Opendp.cpp:L298`) and writes results back to the database with
+`src/dpl/src/Opendp.cpp:L298`) — **before** the write-back, which is what makes
+those numbers original-position displacement, as
+[Reporting and statistics](#reporting-and-statistics) sets out — and writes results
+back to the database with
 `updateDbInstLocations()` (`src/dpl/src/Opendp.cpp:L190`;
 `src/dpl/src/Opendp.cpp:L242`), which moves only cells that are neither fixed nor
 non-standard (`src/dpl/src/Opendp.cpp:L244-L245`). With
@@ -2044,12 +2518,12 @@ non-standard (`src/dpl/src/Opendp.cpp:L244-L245`). With
 block is **not** entered and legalization completes.
 
 The complete chain, for reference:
-`detailedPlacement` (`Opendp.cpp:L116`) → `diamondDPL` (`Place.cpp:L62`) →
-`place` (`Place.cpp:L321`) → `diamondMove` (`Place.cpp:L633`, then `L639`) →
-`legalGridPt` (`Place.cpp:L1409`) → `legalPt` (`Place.cpp:L1366`, then `L1142`) →
-`diamondSearch` (`Place.cpp:L839`) → `calcDist` (`Place.cpp:L935`) →
-`canBePlaced` (`Place.cpp:L942`) → `checkPixels` (`Place.cpp:L1009`) →
-`placeCell` (`Place.cpp:L1420`) → `setGridLoc` (`Place.cpp:L1415`).
+`detailedPlacement` (`src/dpl/src/Opendp.cpp:L116`) → `diamondDPL` (`src/dpl/src/Place.cpp:L62`) →
+`place` (`src/dpl/src/Place.cpp:L321`) → `diamondMove` (`src/dpl/src/Place.cpp:L633`, then `L639`) →
+`legalGridPt` (`src/dpl/src/Place.cpp:L1409`) → `legalPt` (`src/dpl/src/Place.cpp:L1366`, then `L1142`) →
+`diamondSearch` (`src/dpl/src/Place.cpp:L839`) → `calcDist` (`src/dpl/src/Place.cpp:L935`) →
+`canBePlaced` (`src/dpl/src/Place.cpp:L942`) → `checkPixels` (`src/dpl/src/Place.cpp:L1009`) →
+`placeCell` (`src/dpl/src/Place.cpp:L1420`) → `setGridLoc` (`src/dpl/src/Place.cpp:L1415`).
 
 
 ## Fence Region (Group) Handling
@@ -2206,8 +2680,8 @@ with no region passes unconditionally
 
 | Parameter | Default | Unit as used by the code | Unit as annotated in the header | Verdict |
 |---|---|---|---|---|
-| `max_displacement_x_` | **500 sites** (`Opendp.cpp:L172`) | **sites** — compared against `GridX` at `Place.cpp:L844-L845` | `sites` (`src/dpl/include/dpl/Opendp.h:L368` — `int max_displacement_x_ = 0;  // sites`) | agrees |
-| `max_displacement_y_` | **100 rows** (`Opendp.cpp:L173`) | **rows** — compared against `GridY` at `Place.cpp:L846-L847` | `sites` (`src/dpl/include/dpl/Opendp.h:L369` — `int max_displacement_y_ = 0;  // sites`) | **disagrees — D3** |
+| `max_displacement_x_` | **500 sites** (`src/dpl/src/Opendp.cpp:L172`) | **sites** — compared against `GridX` at `src/dpl/src/Place.cpp:L844-L845` | `sites` (`src/dpl/include/dpl/Opendp.h:L368` — `int max_displacement_x_ = 0;  // sites`) | agrees |
+| `max_displacement_y_` | **100 rows** (`src/dpl/src/Opendp.cpp:L173`) | **rows** — compared against `GridY` at `src/dpl/src/Place.cpp:L846-L847` | `sites` (`src/dpl/include/dpl/Opendp.h:L369` — `int max_displacement_y_ = 0;  // sites`) | **disagrees — D3** |
 
 **The defaults are all-or-nothing.** The guard is
 `if (max_displacement_x == 0 || max_displacement_y == 0) {`
@@ -2225,7 +2699,7 @@ establish it. First, the informational message: `DPL 5` reads
 `"Diamond search max displacement: +/- {} sites horizontally, "` followed by
 `"+/- {} rows vertically."` (`src/dpl/src/Opendp.cpp:L179-L184`) — **sites
 horizontally, rows vertically** — and that exact text appears in the committed
-expected output of the regression corpus, `src/dpl/test/simple01.ok`, as
+expected output of the regression corpus at `src/dpl/test/simple01.ok:L8`, as
 `[INFO DPL-0005] Diamond search max displacement: +/- 500 sites horizontally, +/- 100 rows vertically.`
 Second, the use site: `GridY y_min = y - max_displacement_y_;`
 (`src/dpl/src/Place.cpp:L846`) subtracts the limit from a **row index**, and the
@@ -2259,14 +2733,46 @@ The limits also reach the grid, not just the search: `Opendp::initGrid`
 large a window to screen start points against
 (`src/dpl/src/infrastructure/Grid.cpp:L128-L133`).
 
-### The one-site-gap option
+### The one-site-gap setting
 
-`-disallow_one_site_gaps` sets `disallow_one_site_gaps_`
-(`src/dpl/include/dpl/Opendp.h:L370`) and gates two things: an extra stage inside
-the legality predicate (`src/dpl/src/Place.cpp:L1036-L1082`) so the search will not
-*create* a one-site hole, and the verifier's deferred second loop
+`disallow_one_site_gaps_` (`src/dpl/include/dpl/Opendp.h:L370`) gates two things:
+an extra stage inside the legality predicate
+(`src/dpl/src/Place.cpp:L1036-L1082`) so the search will not *create* a one-site
+hole, and the verifier's deferred second loop
 (`src/dpl/src/CheckPlacement.cpp:L91-L97`) so `check_placement` will *report* one
-under `DPL 7` (`src/dpl/src/CheckPlacement.cpp:L120`).
+under `DPL 7` (`src/dpl/src/CheckPlacement.cpp:L120`), with the matching term
+added to the failure total only when the member is set
+(`src/dpl/src/CheckPlacement.cpp:L132`).
+
+**It is not a user-settable option, despite the command-line flag.** The
+`-disallow_one_site_gaps` flag still parses on three commands, and on each one the
+Tcl layer does nothing but warn that it is deprecated. On `detailed_placement` the
+warning is `DPL 3` (`src/dpl/src/Opendp.tcl:L42-L44`); on `check_placement` it is
+`DPL 4` (`src/dpl/src/Opendp.tcl:L146-L148`); on `improve_placement` it is
+`DPL 343` (`src/dpl/src/Opendp.tcl:L182-L184`). The flag's value is never
+forwarded to C++ — the arguments `detailed_placement_cmd` receives are the two
+displacement limits, the report file name, and the `-incremental`,
+`-use_negotiation` and `-abacus` flags (`src/dpl/src/Opendp.tcl:L53-L56`).
+
+The member is **derived from the cell library instead**, once per import:
+`disallow_one_site_gaps_ = !odb::hasOneSiteMaster(db_);`
+(`src/dpl/src/dbToOpendp.cpp:L177`), inside `Opendp::importDb`
+(`src/dpl/src/dbToOpendp.cpp:L171`), which both entry points call before anything
+else — `Opendp::detailedPlacement` at `src/dpl/src/Opendp.cpp:L125` and
+`Opendp::checkPlacement` at `src/dpl/src/CheckPlacement.cpp:L30`.
+`odb::hasOneSiteMaster` (`src/odb/src/db/util.cpp:L345-L378`) walks every master in
+every library, skipping blocks, pads, covers, the four end-cap corner types and
+pad-class sites, and returns true as soon as one master's width equals its site's
+width (`src/odb/src/db/util.cpp:L371-L373`). So gaps are disallowed exactly when the
+library contains **no** single-site-wide filler-capable master: with nothing narrow
+enough to fill a one-site hole, such a hole is unfillable and therefore treated as
+illegal. The same expression independently configures the design-rule engine
+(`src/dpl/src/dbToOpendp.cpp:L205`).
+
+A consequence worth stating: because the value follows the library rather than the
+command, the one-site-gap stage is either on or off for an entire design and cannot
+be toggled per run. The immediate debug print after the assignment
+(`src/dpl/src/dbToOpendp.cpp:L178-L183`) is how to observe which way it resolved.
 
 ### Reporting and statistics
 
@@ -2288,19 +2794,83 @@ after, publishing `route__wirelength__estimated`
 The measure behind all of it is `Opendp::disp`
 (`src/dpl/src/Opendp.cpp:L387-L391`):
 
-- it takes the cell's pre-legalization position,
+- it reads one endpoint out of the database,
   `const DbuPt init = initialLocation(cell, false);`
-  (`src/dpl/src/Opendp.cpp:L389`);
+  (`src/dpl/src/Opendp.cpp:L389`), and `Opendp::initialLocation` obtains it with
+  `cell->getDbInst()->getLocation(loc.x.v, loc.y.v);`
+  (`src/dpl/src/Place.cpp:L1352`);
 - and returns
   `sumXY(abs(init.x - cell->getLeft()), abs(init.y - cell->getBottom()))`
-  (`src/dpl/src/Opendp.cpp:L390`).
+  (`src/dpl/src/Opendp.cpp:L390`), whose other endpoint is the `Node`'s
+  legalized position held in memory.
 
-It is **unweighted** and in **database units**, measured from the cell's
-**original** position — three properties that distinguish it from
-`Opendp::calcDist`, which is weighted and measured from a *search origin*. See
+It is **unweighted** and in **database units** — two properties that distinguish it
+from `Opendp::calcDist`, which is weighted and measured from a *search origin*. See
 TABLE 3 in [The Exact Metric: calcDist](#the-exact-metric-calcdist). `disp` is
 also the sort key of both refinement passes
 (`src/dpl/src/Place.cpp:L564-L566` and `src/dpl/src/Place.cpp:L615-L617`).
+
+**What "original position" depends on — the order of two calls.** `disp` compares
+two things that are stored in *different places*: `initialLocation` reads the
+**OpenDB instance** location (`src/dpl/src/Place.cpp:L1352`) while `cell->getLeft()`
+and `cell->getBottom()` read the **`Node`'s** working coordinates. The statistic
+therefore means "original versus legalized" only while those two stores still
+disagree — that is, only while the database has not yet been overwritten with the
+result. The two engines order those writes differently.
+
+- **Default engine — the statistic is genuine.** The dispatch runs `diamondDPL()`
+  (`src/dpl/src/Opendp.cpp:L188`), then `findDisplacementStats()`
+  (`src/dpl/src/Opendp.cpp:L189`), and only then `updateDbInstLocations()`
+  (`src/dpl/src/Opendp.cpp:L190`). Nothing inside `diamondDPL` writes to the
+  database — `Opendp::placeCell` writes only the node and the grid: `setGridLoc`
+  assigns `setLeft` and `setBottom` (`src/dpl/src/Place.cpp:L1417-L1418`),
+  `paintPixel` marks the pixels (`src/dpl/src/Place.cpp:L1426`), and no statement in
+  the function writes the database instance's location
+  (`src/dpl/src/Place.cpp:L1420-L1439`). So when the statistics are gathered the
+  instance still holds the global-placement position and the `Node` holds the
+  legalized one, and `disp` measures exactly the perturbation the legalizer
+  introduced.
+- **Optional engine — the statistic is not that.** The dispatch runs
+  `negotiation.legalize()` (`src/dpl/src/Opendp.cpp:L224`), then
+  `negotiation.setDplPositions()` (`src/dpl/src/Opendp.cpp:L225`), and reaches
+  `findDisplacementStats()` only at `src/dpl/src/Opendp.cpp:L237`. But
+  `NegotiationLegalizer::legalize` already writes the database itself: its final
+  phase calls `flushToDb()` (`src/dpl/src/NegotiationLegalizer.cpp:L306`) —
+  unconditionally, past the single early return that guards a missing block
+  (`src/dpl/src/NegotiationLegalizer.cpp:L108-L110`) — and that routine issues
+  `cell.db_inst->setLocation(db_x, db_y);`
+  (`src/dpl/src/NegotiationLegalizer.cpp:L386`) with the **legalized** coordinates
+  `db_x = die_xlo_ + cell.x * site_width_` and
+  `db_y = die_ylo_ + dplGrid->gridYToDbu(GridY{cell.y}).v`
+  (`src/dpl/src/NegotiationLegalizer.cpp:L383-L384`), where `die_xlo_` and
+  `die_ylo_` are the core rectangle's minima
+  (`src/dpl/src/NegotiationLegalizer.cpp:L520-L521`). `setDplPositions` then writes
+  the *same* legalized position into the `Node`, core-relative:
+  `const int coreX = cell.x * site_width_;` with
+  `coreY = opendp_->grid_->gridYToDbu(GridY{cell.y}).v`
+  (`src/dpl/src/NegotiationLegalizer.cpp:L484-L485`), assigned at
+  `src/dpl/src/NegotiationLegalizer.cpp:L486-L487`. Because `initialLocation`
+  subtracts the same core minima (`src/dpl/src/Place.cpp:L1353-L1357`), both
+  operands of `disp` are then the identical value, so every cell the negotiation
+  engine moved contributes **zero** to the totals. The three published displacement
+  metrics on that branch consequently report the residual from cells the engine did
+  not touch — it skips fixed cells and cells with no database instance
+  (`src/dpl/src/NegotiationLegalizer.cpp:L380-L382` and
+  `src/dpl/src/NegotiationLegalizer.cpp:L479-L481`) — and not the perturbation the
+  engine introduced. That engine reports its own displacement separately, from its
+  own bookkeeping, in the `DPL` debug line at
+  `src/dpl/src/NegotiationLegalizer.cpp:L298-L301`.
+
+This is recorded as an observed characteristic, not argued against; the default
+engine, which is this document's subject, is unaffected.
+
+The metric keys are identical on both paths — nothing here changes a key or an
+expression — so a consumer that reads `design__instance__displacement__total`,
+`__mean` or `__max` cannot tell the two baselines apart from the key alone and
+must know which engine ran. The wirelength figures are unaffected on either path,
+because `hpwl_before_` is captured once at `src/dpl/src/Opendp.cpp:L168-L169`,
+before the dispatch is entered, and is therefore a genuine pre-legalization
+baseline in both cases.
 
 Utilization is reported separately and earlier, as `DPL 6`
 (`src/dpl/src/Opendp.cpp:L155-L160`) with the published metric key
@@ -2317,8 +2887,9 @@ change to any of them.
 
 ### 1. One pointer-ordered container remains on the default path
 
-`Opendp::ripUpAndReplace` collects the neighbourhood it will evict into
-`std::set<Node*> region_cells;` (`src/dpl/src/Place.cpp:L689`). A `std::set` of
+`Opendp::ripUpAndReplace` collects every non-fixed occupant of the window it will
+consider evicting into `std::set<Node*> region_cells;`
+(`src/dpl/src/Place.cpp:L689`). A `std::set` of
 raw pointers orders its elements by pointer value, so the order in which
 neighbours are unplaced (`src/dpl/src/Place.cpp:L710`) and later re-placed
 (`src/dpl/src/Place.cpp:L733`) follows the addresses the allocator happened to
@@ -2331,10 +2902,12 @@ The file's own note above the escalation records this
 `// and experiments show no legalization for failed diamond searches.`
 
 This is the one place on the default path where behaviour can depend on allocation
-addresses. It stands in contrast to the general pass, whose ordering is terminated
-by a unique instance-name key (`src/dpl/src/Place.cpp:L316-L318`) resting on a
-name-ordered stable sort (`src/dpl/src/dbToOpendp.cpp:L259-L260`), as
-[The Determinism Foundation](#the-determinism-foundation) describes.
+addresses. It stands in contrast to the general pass, whose ordering is pinned by a
+unique instance-name key (`src/dpl/src/Place.cpp:L316-L318`) that needs no help
+from anything upstream — see
+[The Determinism Foundation](#the-determinism-foundation), where that guarantee and
+the separate one supplied by the name-ordered network sort
+(`src/dpl/src/dbToOpendp.cpp:L259-L260`) are kept apart.
 
 ### 2. Three secondary sorts have no unique final key
 
@@ -2346,9 +2919,9 @@ scalar key and nothing behind it:
 
 | Sort | Call site | Key |
 |---|---|---|
-| `brickPlace1` | `Place.cpp:L485-L487` | `rectDist(cell, boundary)`, the group bounding box (`Place.cpp:L482`) |
-| `brickPlace2` | `Place.cpp:L539-L542` | `rectDist(cell, *cell->getRegion())` |
-| `groupRefine` | `Place.cpp:L564-L566` | `disp(cell)`, descending |
+| `brickPlace1` | `src/dpl/src/Place.cpp:L485-L487` | `rectDist(cell, boundary)`, the group bounding box (`src/dpl/src/Place.cpp:L482`) |
+| `brickPlace2` | `src/dpl/src/Place.cpp:L539-L542` | `rectDist(cell, *cell->getRegion())` |
+| `groupRefine` | `src/dpl/src/Place.cpp:L564-L566` | `disp(cell)`, descending |
 
 Both keys admit ties by construction rather than by accident. `Opendp::rectDist`
 (`src/dpl/src/Place.cpp:L526-L531`) measures to whichever corner of the rectangle
@@ -2376,11 +2949,21 @@ sorted vectors placing each cell with `diamondMove`
 claims sites the later one then cannot use, and a cell that finds none is a hard
 error — `DPL 16` (`src/dpl/src/Place.cpp:L498`) and `DPL 17`
 (`src/dpl/src/Place.cpp:L554`). `groupRefine` is stronger still: it does not
-process the whole vector but only its first
-`sort_by_disp.size() * group_refine_percent_` entries
-(`src/dpl/src/Place.cpp:L569`), with `group_refine_percent_ = .05`
-(`src/dpl/include/dpl/Opendp.h:L404`), so the order decides **which** 5% of the
-group is refined at all, not merely in what sequence.
+process the whole vector but only a leading prefix of it. The loop bound is
+`i < sort_by_disp.size() * group_refine_percent_`
+(`src/dpl/src/Place.cpp:L569`) with `group_refine_percent_ = .05`
+(`src/dpl/include/dpl/Opendp.h:L404`), so the order decides **which** cells are
+refined at all, not merely in what sequence.
+
+That prefix is not exactly one twentieth of the group. The loop counter is an `int`
+compared against a `double` product, so it stops at the first index that reaches the
+bound and the number of cells processed is the **ceiling of the group size divided
+by 20** — equal to one twentieth only when the group size is a multiple of 20. A
+group of 1 cell has 1 cell
+refined, which is the whole group; a group of 21 has 2, which is 9.5 %; a group of 40
+has 2, which is 5 % exactly. The same rounding governs `refine_percent_ = .02`
+(`src/dpl/include/dpl/Opendp.h:L405`) in the uncalled `Opendp::refine`, at
+`src/dpl/src/Place.cpp:L620`.
 
 `Opendp::refine` differs on the input side — it builds its vector by walking
 `network_->getNodes()` (`src/dpl/src/Place.cpp:L604-L614`), so its input order
@@ -2404,8 +2987,8 @@ database row, a rectangle sized from the displacement limits around that row.
 
 The flag is that classification and **not** an exact statement of unreachability,
 for the reason the next paragraph quantifies, and it is read only where an origin
-is chosen — by `Opendp::legalPt` (`src/dpl/src/Place.cpp:L1381`) and
-`Opendp::moveHopeless` (`src/dpl/src/Place.cpp:L1213-L1257`). Neither
+is chosen — by `Opendp::legalPt` (`src/dpl/src/Place.cpp:L1366-L1381`) and
+`Opendp::moveHopeless` (`src/dpl/src/Place.cpp:L1204-L1257`). Neither
 `Opendp::diamondSearch` nor `Opendp::checkPixels` consults it
 (`src/dpl/src/Place.cpp:L839-L933`, `src/dpl/src/Place.cpp:L1009-L1101`), so a
 flagged pixel is never ruled out as a *destination*; the flag only moves the point
@@ -2509,16 +3092,16 @@ there. Recorded as **D2**.
 ### Recorded observations index
 
 Ten doc-versus-code discrepancies (`D1`-`D10`) were identified while deriving
-this document, and deriving it turned up two further observations (`O1` and the
-note that closes this section). All are recorded; **none is fixed here and no
-remedy is proposed for any of them.** This document is Markdown and changes no
-source file.
+this document, and deriving it turned up five further observations (`O1`, `O2`,
+`O3`, `O4` and the note that closes this section). All are recorded; **none is fixed
+here and no remedy is proposed for any of them.** This document is Markdown and
+changes no source file.
 
 | ID | Location (at pin) | Observation |
 |---|---|---|
 | **D1** | `src/dpl/README.md:L15-L17` | Describes the default engine as a BFS-style diamond search expanding outward in Manhattan order. Measured against source it is inaccurate on the search class, on the driving data structure, and on the metric; the verified behaviour is documented in [It Is a Best-First Search, Not a BFS](#it-is-a-best-first-search-not-a-bfs). |
 | **D2** | `src/dpl/README.md:L229` | The `## Limitations` section is scoped to the optional negotiation engine only, so the default engine's characteristics appear nowhere there. Items 1-8 of this section supply them. |
-| **D3** | `src/dpl/include/dpl/Opendp.h:L369` and `L106` | The vertical displacement limit is annotated `// sites`. The code compares it against `GridY` row indices (`src/dpl/src/Place.cpp:L846-L847`) and `DPL 5` reports it as rows (`src/dpl/src/Opendp.cpp:L179-L184`), corroborated by `src/dpl/test/simple01.ok`. Documented here as **rows** (TABLE 4). |
+| **D3** | `src/dpl/include/dpl/Opendp.h:L369` and `L106` | The vertical displacement limit is annotated `// sites`. The code compares it against `GridY` row indices (`src/dpl/src/Place.cpp:L846-L847`) and `DPL 5` reports it as rows (`src/dpl/src/Opendp.cpp:L179-L184`), corroborated by `src/dpl/test/simple01.ok:L8`. Documented here as **rows** (TABLE 4). |
 | **D4** | `src/dpl/README.md:L50` | A caption inside the ASCII figure attributes cell swapping to bipartite matching. The routine at `src/dpl/src/NegotiationLegalizerPass.cpp:L820` swaps pairs of same-type cells when total displacement decreases, per its own banner at `L815-L818`, and the accompanying greedy pass uses an unweighted grid-space measure at `L789`. |
 | **D5** | `src/dpl/README.md:L24-L56` | An untagged fenced block presented with no caption, positioned so it reads as module-wide although it depicts only the optional engine's pass structure. This document uses Mermaid figures instead. |
 | **D6** | five sites | Spellings left exactly as found, and quoted verbatim wherever this document quotes them: the published metric key `utilizatin__before__dpl` (`src/dpl/src/Opendp.cpp:L161`) — a published key, so its text is observable output; the local identifier `taget_cell_pixel` (`src/dpl/src/Place.cpp:L684`); `non-deteministic` in the TODO (`src/dpl/src/Place.cpp:L398`); `mearly` in the `moveHopeless` header (`src/dpl/src/Place.cpp:L1201`); and `max_displacment` in the interface comment (`src/dpl/include/dpl/Opendp.h:L106`). |
@@ -2527,6 +3110,9 @@ source file.
 | **D9** | `src/dpl/src/Place.cpp:L1003-L1004` | The comment sits above the **no-region** return at `L1005`, the has-region branch having already returned at `L997` or `L1001`, yet it is phrased as a statement about the has-region case; and the containment direction it states is the reverse of the code at `L997`, which requires the cell box to be covered by the region box. The verified behaviour is in [Fence Region (Group) Handling](#fence-region-group-handling). |
 | **D10** | `src/dpl/src/Place.cpp:L1008` | `// Check all pixels are empty.` describes `Opendp::checkPixels` (`L1009-L1101`), which is the full seven-stage legality predicate. The verified contract is in [The Legality Predicate Chain](#the-legality-predicate-chain). |
 | **O1** | `src/dpl/src/infrastructure/Grid.h:L228` | The trailing comment on `uniform_row_height_` reads `// unset if hybrid`. The implementation clears the optional on a different condition: `Grid::examineRows` sets `has_hybrid_rows_` from `site->isHybrid()` (`src/dpl/src/infrastructure/Grid.cpp:L706-L708`) but derives `uniform_row_height_` in a separate pass that resets it only when the larger of two site heights is not an exact multiple of the smaller (`src/dpl/src/infrastructure/Grid.cpp:L744-L767`), so a hybrid-row design whose site heights are integer multiples of one another retains a value. `Grid::isMultiHeight` consults the optional independently of hybridness (`src/dpl/src/infrastructure/Grid.cpp:L781-L788`). Documented as the code behaves in [Rows and the Variable-Height Row Table](#rows-and-the-variable-height-row-table); the comment is left exactly as found. |
+| **O2** | `src/dpl/src/infrastructure/Coordinates.h:L20-L24` | The header comment states that multiplication and division "are intentionally not defined" on `TypedCoordinate`. The template in fact inherits `boost::dividable` and `boost::multipliable` in both the same-type and `int` forms (`src/dpl/src/infrastructure/Coordinates.h:L35-L38`) and defines `operator/=` (`L90-L99`) and `operator*=` (`L101-L110`), so both operations are available between values of the same coordinate type and between a coordinate and an `int`. What is genuinely unavailable is *cross-space* arithmetic, which the per-`T` instantiation prevents. Documented as the code behaves in [Strongly-Typed Coordinates](#strongly-typed-coordinates); the comment is left exactly as found. |
+| **O3** | `src/dpl/src/Place.cpp:L711` and `L739` | The eviction and re-placement guard inside `Opendp::ripUpAndReplace` is `target_cell->inGroup() == around_cell->inGroup()`, an equality of two booleans rather than of two group identities. Its grouped-target half is unreachable: the routine's only call site (`src/dpl/src/Place.cpp:L400`) draws from `sorted_cells`, which admits a cell only when `!(cell->isFixed() \|\| cell->inGroup() \|\| cell->isPlaced())` holds (`src/dpl/src/Place.cpp:L371`), so the left operand is always false and the guard is always `!around_cell->inGroup()`. Were a grouped target ever passed in, the guard would evict grouped neighbours including any belonging to a *different* region, because two cells in different regions are both grouped and so satisfy the equality. Documented as the reachable path behaves in [The three phases](#the-three-phases). |
+| **O4** | `src/dpl/src/Opendp.cpp:L224-L237` | On the **optional** engine's branch the displacement statistics are gathered after the results have already been written to the database. `NegotiationLegalizer::legalize` calls `flushToDb()` (`src/dpl/src/NegotiationLegalizer.cpp:L306`), which assigns the legalized location to each instance (`src/dpl/src/NegotiationLegalizer.cpp:L383-L386`); `setDplPositions()` then assigns the same legalized position to the matching node object (`src/dpl/src/NegotiationLegalizer.cpp:L484-L487`). Since `Opendp::disp` compares an instance-derived original against the node's coordinates (`src/dpl/src/Opendp.cpp:L389-L390`), both operands are then equal and every cell that engine moved contributes zero. The default engine is unaffected: it gathers statistics at `src/dpl/src/Opendp.cpp:L189` and writes back only at `src/dpl/src/Opendp.cpp:L190`. Documented as the code behaves in [Reporting and statistics](#reporting-and-statistics). |
 
 One further observation, adjacent to D4: the optional engine's three
 post-optimization calls exist in source as commented-out lines,
@@ -2556,13 +3142,21 @@ search for recovery. It reports `DPL 1102`
 constructs a `NegotiationLegalizer` (`src/dpl/src/Opendp.cpp:L217-L222`), forwards
 the Abacus flag with `negotiation.setRunAbacus(run_abacus);`
 (`src/dpl/src/Opendp.cpp:L223`), runs `legalize()`
-(`src/dpl/src/Opendp.cpp:L224`) and writes positions back with
-`setDplPositions()` (`src/dpl/src/Opendp.cpp:L225`). It then converges or does
+(`src/dpl/src/Opendp.cpp:L224`) and then copies the result into the placer's own
+node objects with `setDplPositions()` (`src/dpl/src/Opendp.cpp:L225`). Note the
+direction: `legalize()` has already written the database itself, through
+`flushToDb()` (`src/dpl/src/NegotiationLegalizer.cpp:L306`), so this second call
+propagates positions *into* `dpl`'s structures rather than out to the database
+(`src/dpl/src/NegotiationLegalizer.cpp:L465`, with its own banner at
+`src/dpl/src/NegotiationLegalizer.cpp:L462`). It then converges or does
 not: a non-zero violation count (`src/dpl/src/Opendp.cpp:L227`) raises the
 `DPL 701` warning (`src/dpl/src/Opendp.cpp:L228-L232`) and publishes
 `NL__no__converge__final_violations` (`src/dpl/src/Opendp.cpp:L233-L234`). Either
-way it finishes with the same statistics and write-back calls the default branch
-uses (`src/dpl/src/Opendp.cpp:L237-L238`).
+way it finishes by making the same two calls the default branch makes
+(`src/dpl/src/Opendp.cpp:L237-L238`) — though, because of the write ordering above,
+the displacement statistics they produce do not mean the same thing on this branch;
+recorded as **O4** and explained in
+[Reporting and statistics](#reporting-and-statistics).
 
 **Two of its passes do not run by default** —
 `src/dpl/src/NegotiationLegalizer.h:L272` and
@@ -2621,24 +3215,38 @@ four files that contribute the most entries and list those entries by line;
 including the `odb`, `utl` and Boost.Geometry routines the document names;
 **Standard library callables** holds the `std` routines, which have no definition
 line here and are therefore given by declaring header, include site and call site;
-and **Key type declarations** holds the types and the named fields. Where a name is
+and **Key type declarations** holds the types and the named data members,
+including the Boost and standard-library types the document names. Where a name is
 overloaded, each overload has its own row, distinguished in the definition column.
 Resolve any entry with `git show 4bc0d66972:<path>`.
 
-**What is deliberately not indexed.** Two categories of name still appear in the
-prose without a row of their own, because a row would list another project's
-surface rather than a name this document reasons about:
+**What the index covers, and what it does not.** The indexed population is every
+**routine, type and named data member** this document names, wherever it is
+defined — inside `dpl`, in `odb`, in `utl`, in Boost or in the standard library.
+There are no discretionary omissions from that population. Six classes of
+code-formatted name in the prose are nevertheless absent, because none of them is
+an entity a reader could look up:
 
-- **OpenDB accessors used only in passing** — `dbInst::getLocation`,
-  `dbInst::getMaster`, `dbMaster::getSite`, `dbSite::isHybrid`, `dbRow::getOrigin`
-  and `dbRow::getSiteCount`. These belong to `src/odb`, and each is cited in place
-  where it matters. The `odb` names the document does reason about — the `Rect`
-  corner accessors, `dbInst::getName`, `dbInst::getConstName`, `dbMaster::isCore`
-  and `dbBlock::findInst` — each have a row below.
-- **Logging** — `utl::Logger::info`, `::warn` and `::metric`. `utl::Logger::error`
-  is indexed because two terminal errors depend on its `noreturn` declaration, and
-  `debugPrint` is indexed because the document discusses the macro itself rather
-  than a call through it.
+- **C++ and Tcl keywords** quoted from source, such as `continue`, `while`,
+  `public` and `private`.
+- **Function-local variables** of routines that are themselves indexed — for
+  example `is_multi_row1` (`src/dpl/src/Place.cpp:L301`), `num_cells`
+  (`src/dpl/src/Place.cpp:L588`) and `positionsHeap`
+  (`src/dpl/src/Place.cpp:L892`). The declaring routine's row is the entry point
+  for each.
+- **Words and identifier spellings quoted from a source comment** rather than
+  written as names: `yLo` and `yHi` from the row-table comment
+  (`src/dpl/src/infrastructure/Grid.h:L216-L217`), `mearly`
+  (`src/dpl/src/Place.cpp:L1201`) and `max_displacment`
+  (`src/dpl/include/dpl/Opendp.h:L106`), the last two recorded as **D6**.
+- **Published metric-key strings.** These are observable output, not code
+  entities, and each is quoted at the line that publishes it.
+- **Tcl command names** — `detailed_placement`, `check_placement`,
+  `global_placement`, `clock_tree_synthesis` and the rest. The module README is
+  the reference for those.
+- **LEF/DEF keywords and corpus design identifiers** such as `SYMMETRY`, `UNITS`
+  and `FILLCELL_X1`, which name a test technology's data rather than this
+  module's code.
 
 ### `src/dpl/src/Place.cpp`
 
@@ -2675,6 +3283,7 @@ surface rather than a name this document reasons about:
 | L828 | `Opendp::distChange` |
 | L839 | `Opendp::diamondSearch` |
 | L880 | `struct PQ_entry` (local to `diamondSearch`) |
+| L882 | `PQ_entry::manhattan_distance` — the frontier's primary key, with `PQ_entry::p` at `L883` and `PQ_entry::sequence` at `L884` |
 | L935 | `Opendp::calcDist` |
 | L942 | `Opendp::canBePlaced` |
 | L967 | `Opendp::checkRegionOverlap` |
@@ -2703,6 +3312,10 @@ surface rather than a name this document reasons about:
 |---|---|
 | L46 | `Opendp::isMultiRow` |
 | L53 | `Opendp::Opendp` (constructor) |
+| L83 | `Opendp::setDebug` — the only writer of `debug_observer_` (`L85`) |
+| L88 | `Opendp::setJumpMoves` |
+| L93 | `Opendp::setIterativePlacement` — the only writer of `iterative_debug_` (`L95`) |
+| L98 | `Opendp::setDeepIterativePlacement` |
 | L106 | `Opendp::setJournal` |
 | L116 | `Opendp::detailedPlacement` |
 | L242 | `Opendp::updateDbInstLocations` |
@@ -2794,16 +3407,17 @@ surface rather than a name this document reasons about:
 | `src/dpl/src/NegotiationLegalizer.cpp:L1186` | `NegotiationLegalizer::runAbacus` |
 | `src/dpl/src/NegotiationLegalizerPass.cpp:L710` | `NegotiationLegalizer::sortByNegotiationOrder` |
 | `src/dpl/src/NegotiationLegalizerPass.cpp:L820` | `NegotiationLegalizer::cellSwap` |
+| `src/dpl/src/Opendp.i:L113-L119` | the SWIG layer that decides both debug gates: `setJumpMoves` (`L113`), `setIterativePlacement` (`L114`) and `setDeepIterativePlacement` (`L115`) are called unconditionally, while `setDebug` (`L119`) is reached only inside `if (dpl::Graphics::guiActive()) {` (`L116`). Cited as the authority on the gating; excluded from every edit as an interface file |
 
 ### Routines named in supporting files
 
 The remaining routines this document names — accessors, interfaces and
-optional-engine helpers the legalization path reaches, followed by the two
-out-of-module rows the section preamble accounts for. None is defined in the
-four files tabulated by line above; where a file also appears under **Other
-files**, that sub-section records a landmark ordering and this one records the
-routines. Ordered by file, then by line, with the entries from outside `dpl` —
-`odb`, `utl` and Boost.Geometry — last.
+optional-engine helpers the legalization path reaches, then the routines it names
+outside this module. None is defined in the four files tabulated by line above;
+where a file also appears under **Other files**, that sub-section records a
+landmark ordering and this one records the routines. Ordered by file, then by
+line, with the entries from outside `dpl` — `odb`, `utl` and Boost.Geometry —
+last.
 
 | Location | Definition |
 |---|---|
@@ -2814,6 +3428,7 @@ routines. Ordered by file, then by line, with the entries from outside `dpl` —
 | `src/dpl/src/infrastructure/Objects.cpp:L124` | `Node::getHeight` |
 | `src/dpl/src/infrastructure/Objects.cpp:L154` | `Node::isFixed` |
 | `src/dpl/src/infrastructure/Objects.cpp:L158` | `Node::isPlaced` |
+| `src/dpl/src/infrastructure/Objects.cpp:L231` | `Node::isStdCell` — the tier filter of the invariant's per-cell loop (declared at `src/dpl/src/infrastructure/Objects.h:L98`) |
 | `src/dpl/src/infrastructure/Objects.cpp:L243` | `Node::getGroup` |
 | `src/dpl/src/infrastructure/Objects.cpp:L247` | `Node::getRegion` |
 | `src/dpl/src/infrastructure/Objects.cpp:L251` | `Node::getMaster` |
@@ -2823,6 +3438,7 @@ routines. Ordered by file, then by line, with the entries from outside `dpl` —
 | `src/dpl/src/infrastructure/Objects.cpp:L483` | `Group::getRects` |
 | `src/dpl/src/infrastructure/Objects.cpp:L487` | `Group::getCells` |
 | `src/dpl/src/infrastructure/Objects.cpp:L491` | `Group::getBBox` |
+| `src/dpl/src/infrastructure/Objects.cpp:L515` | `Group::addCell` — fills the group's cell vector in database iteration order (declared at `src/dpl/src/infrastructure/Objects.h:L185`) |
 | `src/dpl/src/infrastructure/Padding.cpp:L93` | `Padding::padLeft` (cell overload) |
 | `src/dpl/src/infrastructure/Padding.cpp:L98` | `Padding::padLeft` (instance overload) |
 | `src/dpl/src/infrastructure/Padding.cpp:L114` | `Padding::padRight` (cell overload) |
@@ -2830,12 +3446,16 @@ routines. Ordered by file, then by line, with the entries from outside `dpl` —
 | `src/dpl/src/infrastructure/Padding.cpp:L135` | `Padding::paddedWidth` |
 | `src/dpl/src/infrastructure/architecture.h:L36` | `Architecture::getRegions` |
 | `src/dpl/src/infrastructure/architecture.h:L124` | `Architecture::Row::getBottom` — the key the row stable sort projects on (class `Architecture::Row` at `L98`) |
+| `src/dpl/src/infrastructure/architecture.cxx:L83` | `Architecture::createAndAddRow` (declared at `src/dpl/src/infrastructure/architecture.h:L34`) |
 | `src/dpl/src/infrastructure/architecture.cxx:L100` | `Architecture::postProcess` |
 | `src/dpl/src/infrastructure/architecture.cxx:L222` | `Architecture::find_closest_row` |
 | `src/dpl/src/infrastructure/architecture.cxx:L246` | `Architecture::powerCompatible` |
 | `src/dpl/src/infrastructure/network.h:L35` | `Network::getNodes` |
+| `src/dpl/src/infrastructure/network.cxx:L380` | `Network::addNode` (instance overload, declared at `src/dpl/src/infrastructure/network.h:L55`) — appends in call order, so the node sequence and the node ids follow the caller's ordering |
+| `src/dpl/src/infrastructure/network.cxx:L407` | `Network::addNode` (block-terminal overload, declared at `src/dpl/src/infrastructure/network.h:L56`) |
 | `src/dpl/src/infrastructure/Grid.h:L142` | `Grid::getRowSiteCount` |
 | `src/dpl/src/infrastructure/Grid.h:L143` | `Grid::getSiteWidth` |
+| `src/dpl/src/infrastructure/Coordinates.h:L121-L125` | `dpl::abs` — the coordinate-typed absolute value the two distance functions call: `template <typename T>` at `L121`, the name at `L122`, returning `TypedCoordinate<T>{std::abs(val.v)}` at `L124` |
 | `src/dpl/src/infrastructure/Coordinates.h:L152` | `GridRect::closestPtInside` (declared at `L143`) |
 | `src/dpl/src/infrastructure/Coordinates.h:L205` | `dbuToGridCeil` (X overload) |
 | `src/dpl/src/infrastructure/Coordinates.h:L210` | `dbuToGridFloor` (X overload) |
@@ -2853,6 +3473,8 @@ routines. Ordered by file, then by line, with the entries from outside `dpl` —
 | `src/dpl/src/graphics/DplObserver.h:L36` | `DplObserver::drawSelected` |
 | `src/dpl/src/graphics/DplObserver.h:L37` | `DplObserver::binSearch` |
 | `src/dpl/src/graphics/DplObserver.h:L43` | `DplObserver::redrawAndPause` |
+| `src/dpl/src/util/journal.cxx:L33` | `Journal::undo` (single-action overload, declared at `src/dpl/src/util/journal.h:L132`) |
+| `src/dpl/src/util/journal.cxx:L76` | `Journal::undo` (whole-journal overload, declared at `src/dpl/src/util/journal.h:L122`) — the only true undo on either path |
 | `src/dpl/src/dbToOpendp.cpp:L171` | `Opendp::importDb` |
 | `src/dpl/src/dbToOpendp.cpp:L483` | `Opendp::adjustNodesOrient` |
 | `src/dpl/src/Optdp.cpp:L52` | `Opendp::improvePlacement` — the `improve_placement` entry point of the alternate detailed-improvement lineage, named here only to mark the boundary of this document's scope |
@@ -2861,20 +3483,41 @@ routines. Ordered by file, then by line, with the entries from outside `dpl` —
 | `src/dpl/src/NegotiationLegalizer.h:L219` | `NegotiationLegalizer::gridAt` (mutable overload) |
 | `src/dpl/src/NegotiationLegalizer.h:L223` | `NegotiationLegalizer::gridAt` (const overload) |
 | `src/dpl/src/NegotiationLegalizer.cpp:L88` | `NegotiationLegalizer::legalize` |
+| `src/dpl/src/NegotiationLegalizer.cpp:L376` | `NegotiationLegalizer::flushToDb` — writes the optional engine's result to the database (declared at `src/dpl/src/NegotiationLegalizer.h:L169`) |
 | `src/dpl/src/NegotiationLegalizer.cpp:L465` | `NegotiationLegalizer::setDplPositions` |
+| `src/dpl/src/NegotiationLegalizer.cpp:L507` | `NegotiationLegalizer::initFromDb` — the one early-return guard in `legalize` (declared at `src/dpl/src/NegotiationLegalizer.h:L166`) |
 | `src/dpl/src/NegotiationLegalizer.cpp:L1126` | `NegotiationLegalizer::snapToLegal` |
 | `src/dpl/src/NegotiationLegalizer.cpp:L1248` | `NegotiationLegalizer::abacusRow` |
 | `src/dpl/src/NegotiationLegalizerPass.cpp:L746` | `NegotiationLegalizer::greedyImprove` |
 | `src/odb/include/odb/db.h:L779` | `dbBlock::findInst` — cited only to establish that an instance name identifies one instance |
+| `src/odb/include/odb/db.h:L2820` | `odb::dbInst::getLocation` — the store `initialLocation` reads, which is why a re-placement starts from the global-placement position (class `dbInst` at `L2674`) |
+| `src/odb/include/odb/db.h:L2979` | `odb::dbInst::getMaster` |
+| `src/odb/include/odb/db.h:L4952` | `odb::dbRow::getOrigin` (class `dbRow` at `L4931`) |
+| `src/odb/include/odb/db.h:L4957` | `odb::dbRow::getOrient` — the per-row orientation the interval map stores |
+| `src/odb/include/odb/db.h:L4967` | `odb::dbRow::getSiteCount` |
+| `src/odb/include/odb/db.h:L5371` | `odb::dbSite::isHybrid` (class `dbSite` at `L5276`) |
 | `src/odb/include/odb/db.h:L5466` | `odb::dbMaster::isCore` (class `dbMaster` at `L5400`) |
+| `src/odb/include/odb/db.h:L5532` | `odb::dbMaster::getSymmetryX` — read into the `Symmetry_X` bit |
+| `src/odb/include/odb/db.h:L5542` | `odb::dbMaster::getSymmetryY` |
+| `src/odb/include/odb/db.h:L5552` | `odb::dbMaster::getSymmetryR90` |
+| `src/odb/include/odb/db.h:L5645` | `odb::dbMaster::getSite` |
+| `src/odb/include/odb/db.h:L8092` | `odb::dbGroup::getInsts` — the database iteration order a group's cell vector inherits (class `dbGroup` at `L8067`) |
+| `src/odb/include/odb/geom.h:L354` | `odb::Rect::mergeInit` — declared in `Rect`, defined inline at `src/odb/include/odb/geom.h:L886`; resets the accumulator the group boundary is merged into |
 | `src/odb/include/odb/geom.h:L368` | `odb::Rect::xMin` (class `Rect` at `L328`) |
 | `src/odb/include/odb/geom.h:L369` | `odb::Rect::yMin` |
 | `src/odb/include/odb/geom.h:L370` | `odb::Rect::xMax` |
 | `src/odb/include/odb/geom.h:L371` | `odb::Rect::yMax` |
+| `src/odb/include/odb/util.h:L28` | `odb::hasOneSiteMaster` — the library probe the one-site-gap member is derived from, defined at `src/odb/src/db/util.cpp:L345` |
 | `src/odb/src/db/dbInst.cpp:L324` | `odb::dbInst::getName` |
 | `src/odb/src/db/dbInst.cpp:L330` | `odb::dbInst::getConstName` — the value the fourth ordering key compares |
+| `src/dpl/src/graphics/Graphics.h:L59` | `dpl::Graphics::guiActive` — the static test that decides whether an observer is ever constructed |
+| `src/utl/include/utl/Logger.h:L146` | `utl::Logger::info` — every `INFO DPL-…` line the module prints |
+| `src/utl/include/utl/Logger.h:L155` | `utl::Logger::warn` — the deprecation and non-convergence warnings |
 | `src/utl/include/utl/Logger.h:L165` | `utl::Logger::error` — declared `noreturn`, which is why `DPL 36` and `DPL 33` terminate the run |
+| `src/utl/include/utl/Logger.h:L190` | `utl::Logger::metric` (template overload) — publishes the displacement and violation keys |
+| `src/utl/include/utl/Logger.h:L208` | `utl::Logger::metric` (string overload) |
 | `src/utl/include/utl/Logger.h:L384` | `debugPrint` — the logging macro |
+| Boost.Geometry — no repository definition | `boost::geometry::index::intersects` — the R-tree predicate `findOverlapInRtree` queries with, at `src/dpl/src/Opendp.cpp:L428` |
 | Boost.Geometry — no repository definition | `boost::geometry::covered_by` — the header is included at `src/dpl/src/Place.cpp:L22` and the call is at `src/dpl/src/Place.cpp:L997` |
 
 ### Standard library callables
@@ -2885,7 +3528,7 @@ translation unit includes that header, and the `dpl` line that calls it.
 
 | Callable | Declared in | Included at | Called at |
 |---|---|---|---|
-| `std::abs` | `<cstdlib>`, `<cmath>` | `src/dpl/src/Place.cpp:L8`, `src/dpl/src/Place.cpp:L6` | `src/dpl/src/Place.cpp:L295-L296` (`centerDist`) and `src/dpl/src/Place.cpp:L937-L938` (`calcDist`); called unqualified, with no `using` declaration for it |
+| `std::abs` | `<cstdlib>`, `<cmath>` | `src/dpl/src/Place.cpp:L8`, `src/dpl/src/Place.cpp:L6` | reached only through the `dpl` wrapper, at `src/dpl/src/infrastructure/Coordinates.h:L124`. The unqualified `abs` calls in `CellPlaceOrderLess::centerDist` (`src/dpl/src/Place.cpp:L293-L297`) and `Opendp::calcDist` (`src/dpl/src/Place.cpp:L935-L940`) — at `L295-L296` and `L937-L938` respectively — resolve to `dpl::abs` instead, indexed above |
 | `std::max` | `<algorithm>` | `src/dpl/src/Place.cpp:L4`, `src/dpl/src/infrastructure/Grid.h:L6` | `src/dpl/src/Place.cpp:L863-L864` (unqualified via `using std::max;` at `src/dpl/src/Place.cpp:L42`) and `src/dpl/src/infrastructure/Grid.h:L58` |
 | `std::min` | `<algorithm>` | `src/dpl/src/Place.cpp:L4` | `src/dpl/src/Place.cpp:L865-L866` (unqualified via `using std::min;` at `src/dpl/src/Place.cpp:L43`) |
 | `std::strcmp` | `<cstring>` | `src/dpl/src/Place.cpp:L9` | `src/dpl/src/Place.cpp:L316` — the fourth ordering key |
@@ -2913,9 +3556,17 @@ translation unit includes that header, and the `dpl` line that calls it.
 | `src/dpl/src/infrastructure/Grid.h:L219` | `row_index_to_y_dbu_` |
 | `src/dpl/src/infrastructure/Grid.h:L220` | `row_index_to_pixel_height_` |
 | `src/dpl/src/infrastructure/Grid.h:L197` | `RowSitesMap`, the per-row interval-map alias, under `// Map intervals in rows to the site/orientation mapping` at `L196` |
+| `src/dpl/src/infrastructure/Grid.h:L179` | `SiteToOrientation` — the value type `RowSitesMap` stores, mapping each site offered by a row span to the orientation that row declares |
+| Boost.ICL — no repository definition | `boost::icl::interval_map` — the container `RowSitesMap` aliases; the header is included at `src/dpl/src/infrastructure/Grid.h:L18` and the template arguments are at `src/dpl/src/infrastructure/Grid.h:L197-L200` |
 | `src/dpl/src/infrastructure/Grid.h:L223` | `row_sites_` |
 | `src/dpl/src/infrastructure/Grid.h:L228` | `uniform_row_height_` |
-| `src/dpl/src/infrastructure/Coordinates.h:L26` | `struct TypedCoordinate` — the template every coordinate alias is built from, with its rationale comment at `L20-L24` |
+| `src/dpl/src/infrastructure/Grid.h:L225` | `has_hybrid_rows_` |
+| `src/dpl/src/infrastructure/Grid.h:L226` | `core_` — the core rectangle the row table's top-boundary fallback returns |
+| `src/dpl/src/infrastructure/Grid.h:L229` | `site_width_` — the scale the metric's horizontal axis multiplies by |
+| `src/dpl/src/infrastructure/Grid.h:L231` | `row_count_` |
+| `src/dpl/src/infrastructure/Grid.h:L232` | `row_site_count_` |
+| `src/dpl/src/infrastructure/Coordinates.h:L26-L27` | `struct TypedCoordinate` — the template every coordinate alias is built from; the template head is at `L26` and the name at `L27`, with the rationale comment at `L20-L24` |
+| `src/dpl/src/infrastructure/Coordinates.h:L27-L38` | the Boost operator mix-ins `TypedCoordinate` inherits, each in a same-type and an `int` form: `boost::totally_ordered` (`L27-L28`), `boost::additive` (`L29-L30`), `boost::modable` (`L31-L32`), `boost::incrementable` (`L33`), `boost::decrementable` (`L34`), `boost::dividable` (`L35-L36`) and `boost::multipliable` (`L37-L38`) — the last two are what **O2** records |
 | `src/dpl/src/infrastructure/Coordinates.h:L195` | `gridToDbu(GridX, DbuX)` |
 | `src/dpl/src/infrastructure/Coordinates.h:L225` | `sumXY(DbuX, DbuY)` |
 | `src/dpl/src/infrastructure/Coordinates.h:L244` | `std::hash<dpl::GridPt>` |
@@ -2924,19 +3575,44 @@ translation unit includes that header, and the `dpl` line that calls it.
 | `src/dpl/include/dpl/Opendp.h:L368` | `max_displacement_x_` |
 | `src/dpl/include/dpl/Opendp.h:L369` | `max_displacement_y_` |
 | `src/dpl/include/dpl/Opendp.h:L370` | `disallow_one_site_gaps_` |
+| `src/dpl/include/dpl/Opendp.h:L366` | `journal_` — default-initialized to `nullptr`, and nothing on either path assigns it |
+| `src/dpl/include/dpl/Opendp.h:L374` | `grid_` |
+| `src/dpl/include/dpl/Opendp.h:L389` | `hpwl_before_` |
+| `src/dpl/include/dpl/Opendp.h:L394` | `debug_observer_` — the GUI-only gate |
+| `src/dpl/include/dpl/Opendp.h:L396` | `jump_moves_` |
+| `src/dpl/include/dpl/Opendp.h:L398` | `iterative_debug_` — the headless-capable gate, independent of the observer |
+| `src/dpl/include/dpl/Opendp.h:L399` | `deep_iterative_debug_` |
+| `src/dpl/include/dpl/Opendp.h:L401` | `use_negotiation_` — the engine-dispatch flag |
+| `src/dpl/include/dpl/Opendp.h:L404` | `group_refine_percent_` — `.05` |
+| `src/dpl/include/dpl/Opendp.h:L405` | `refine_percent_` — `.02` |
+| `src/dpl/include/dpl/Opendp.h:L406` | `rand_seed_` — `777`, which is what makes the random swapping pass reproducible |
 | `src/dpl/src/infrastructure/Objects.h:L59` | `class Node` |
 | `src/dpl/src/infrastructure/Objects.h:L171` | `class Group` |
 | `src/dpl/src/infrastructure/Padding.h:L15` | `class Padding` |
 | `src/dpl/src/infrastructure/architecture.h:L22` | `class Architecture` |
 | `src/dpl/src/infrastructure/network.h:L32` | `class Network` |
 | `src/dpl/src/PlacementDRC.h:L35` | `class PlacementDRC` (the header has no licence block — recorded as **D7**) |
+| `src/dpl/src/infrastructure/Objects.h:L18` | `class MasterEdge` |
 | `src/dpl/src/infrastructure/Objects.h:L30` | `class Master` |
+| `src/dpl/src/infrastructure/Objects.h:L198` | `class Edge` |
+| `src/dpl/src/infrastructure/Objects.h:L214` | `class Pin` (forward-declared at `L56`) |
+| `src/dpl/src/infrastructure/Objects.h:L141` | `Node::left_`, with `Node::bottom_` at `L142` — the coordinates the eviction leaves untouched |
+| `src/dpl/src/infrastructure/Objects.h:L194` | `Group::boundary_` — the merged region rectangle `Group::getBBox` returns |
 | `src/dpl/src/infrastructure/Objects.h:L62` | `Node::Type`, the node kind enumeration (`CELL` at `L65`) |
 | `src/dpl/src/infrastructure/architecture.h:L98` | `class Architecture::Row` (forward-declared at `L27`) |
+| `src/dpl/src/util/symmetry.h:L9` | `Symmetry_X`, with `Symmetry_Y` at `L10` and `Symmetry_ROT90` at `L11` — the bits the master-symmetry stage tests, alongside `Symmetry_UNKNOWN` at `L8` |
+| `src/dpl/src/util/journal.h:L17` | `enum class JournalActionTypeEnum` |
+| `src/dpl/src/util/journal.h:L22` | `class JournalAction` — the base of `MoveCellAction` (`L28`) and `UnplaceCellAction` (`L73`) |
 | `src/dpl/src/util/journal.h:L91` | `class Journal` |
 | `src/dpl/src/util/journal.h:L96` | `Journal::addAction(const MoveCellAction&)` |
 | `src/dpl/src/util/journal.h:L104` | `Journal::addAction(const UnplaceCellAction&)` |
 | `src/dpl/src/graphics/DplObserver.h:L30` | `class DplObserver` |
+| `src/odb/include/odb/dbTypes.h:L25` | `class dbOrientType` — the orientation enumeration the symmetry switch runs over |
+| `<queue>`, included at `src/dpl/src/Place.cpp:L13` | `std::priority_queue`, instantiated as the frontier at `src/dpl/src/Place.cpp:L891-L892` |
+| `<functional>`, included at `src/dpl/src/Place.cpp:L10` | `std::greater`, the comparator argument that makes that queue a min-heap (`src/dpl/src/Place.cpp:L891`) |
+| `<unordered_set>`, included at `src/dpl/src/Place.cpp:L18` | `std::unordered_set`, the closed set at `src/dpl/src/Place.cpp:L893` |
+| `<set>`, included at `src/dpl/src/Place.cpp:L15` | `std::set`, the pointer-ordered rip-up container at `src/dpl/src/Place.cpp:L689` — recorded as **D2** |
+| `src/dpl/src/NegotiationLegalizer.h:L253` | `die_xlo_`, with `die_ylo_` at `L254` — the core rectangle minima the optional engine adds back when converting its grid coordinates |
 | `src/dpl/src/NegotiationLegalizer.h:L272` | `run_abacus_` |
 
 ## References
@@ -2974,4 +3650,3 @@ registration (`docs/toc.yml`), the coding practices governing how constants and
 their units are described (`docs/contrib/CodingPractices.md`), the comment
 discipline that keeps existing comments intact (`docs/agents/coding.md`), and the
 structural precedent of `src/drt/doc/RoutingFlow.md`.
-

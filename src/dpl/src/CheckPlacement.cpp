@@ -34,13 +34,20 @@ using utl::format_as;  // NOLINT(misc-unused-using-decls)
 // produced by any tool, or simply read from disk, can be checked.
 //
 // The nine separate failure vectors exist so that each class of violation
-// is reported under its own stable identifier and can be searched for on
-// its own; one combined list would collapse them into a single
-// unattributable error.  initGrid() and groupAssignCellRegions() must run
-// before the loop because every per-cell test below but one reads either
-// the pixel grid or a cell's assigned region, and neither exists until
-// they do.  The placed check is that one exception: it reads the
-// instance's own status and depends on neither.
+// is reported under its own message identifier rather than collapsed into
+// a single unattributable error, and the mapping from check to identifier
+// is stable across runs.  The number alone is not unique module-wide,
+// though: two of the nine are also used by informational messages emitted
+// earlier in detailed placement - 5 for the displacement limits and 6 for
+// the utilization report, both in Opendp.cpp - so a log search on one of
+// those two numbers needs the warning level and the check name carried in
+// the message text to tell a violation apart from an informational line.
+// The other seven - 3, 4, 7, 8, 9, 10 and 11 - are used nowhere else in
+// the module.  initGrid() and groupAssignCellRegions() must run before the
+// loop because every per-cell test below but one reads either the pixel
+// grid or a cell's assigned region, and neither exists until they do.  The
+// placed check is that one exception: it reads the instance's own status
+// and depends on neither.
 //
 // The order inside the per-cell loop is forced, not incidental:
 //   - Site alignment comes first and is the only check that abandons the

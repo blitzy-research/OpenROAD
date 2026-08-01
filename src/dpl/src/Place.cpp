@@ -892,18 +892,28 @@ bool Opendp::ripUpAndReplace(Node* target_cell)
 // Swapping is the one move that needs no free space, which is why the
 // random-swap pass over a fence region's cells is built on it.  The
 // identical width and height requirement is what keeps it cheap: each cell
-// inherits the other's committed footprint exactly, so no pixel outside
-// those two footprints is written and neither cell can come to overlap
-// anything a search would otherwise have had to find room around.
+// inherits the other's occupied footprint exactly, so the set of pixels
+// recorded as holding a cell is the same after the exchange as before, and
+// neither cell can come to overlap anything a search would otherwise have
+// had to find room around.
+//
+// That accounts for occupancy only.  Padding lives in its own pixel field
+// and paintPixel() finishes by calling paintCellPadding(), which reserves
+// from a per-cell left and right pad, so two masters of equal width and
+// height can still reserve different extents and each move can mark pixels
+// the counterpart had never reserved at that site.  Padding conflicts are
+// therefore left to the design-rule re-check below rather than excluded by
+// the dimension test.
 //
 // Preserving the footprints is not the same as preserving legality, and the
 // re-check here is narrower than the one a search runs.  What is rerun is
 // the design-rule engine for both cells, which covers four things: edge
 // spacing, padding, blocked layers and the one-site gap.  The
-// equal-dimension requirement bounds which pixels the exchange writes; it
-// says nothing about the properties that depend on the master or on the
-// destination row, and two masters of equal width and height can still
-// declare different symmetry and still present different rail polarity.
+// equal-dimension requirement bounds which pixels the exchange marks as
+// occupied; it says nothing about the properties that depend on the master
+// or on the destination row, and two masters of equal width and height can
+// still declare different symmetry and still present different rail
+// polarity.
 // None of site availability, fence-region containment, master symmetry
 // against the site orientation, or power-rail parity across the span of a
 // multi-row cell is rerun here, so on those counts each cell carries over
@@ -1131,9 +1141,12 @@ PixelPt Opendp::diamondSearch(const Node* cell,
 // database-unit types; summing raw grid indices would silently add two
 // incommensurable quantities.
 // The vertical term has to consult the row table rather than multiply by a
-// constant because a hybrid-row design has no single row height at all,
-// which is why the grid holds uniform_row_height_ as an optional and
-// exposes gridYToDbu() as a lookup.
+// constant because rows are not required to share a height.  gridYToDbu()
+// resolves a row index through row_index_to_y_dbu_ on every design, hybrid
+// or not, so the conversion never depends on a design-wide pitch existing;
+// the grid's uniform_row_height_ optional is a separate quantity that
+// feeds height classification in gridHeight() and isMultiHeight(), not
+// this conversion.
 // The consequence is an asymmetry worth knowing about: one row of vertical
 // travel costs as much as row_height / site_width sites of horizontal
 // travel, a large ratio for an ordinary single-height row.  The search

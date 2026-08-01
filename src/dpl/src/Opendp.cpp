@@ -747,8 +747,11 @@ void Opendp::setGridCell(Node& cell, Pixel* pixel)
 // placement pass in Place.cpp that chooses between the two
 // brick-placement strategies, and that runs on the other path only.
 //
-// Each row contributes its own height instead of a shared one, because
-// hybrid-row designs have no single row height to assume.
+// Each row contributes its own height instead of a shared one, because rows
+// are not required to share a height: rowHeight(y) is read per row, so the
+// site area is right whether or not the design happens to have a single
+// pitch, and the tally never has to consult the grid's optional uniform
+// row height.
 void Opendp::groupAssignCellRegions()
 {
   const int64_t site_width = grid_->getSiteWidth().v;

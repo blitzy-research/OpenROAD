@@ -73,21 +73,26 @@ void Grid::visitDbRows(odb::dbBlock* block,
 // derived, not from the core rectangle, because with rows of differing
 // heights the number of rows is not the core height divided by anything.
 // The vectors are sized once and reused: the resize runs only while the grid
-// is still empty, whereas the loop below runs on every pass, so repeated
-// legalization, filler and check passes share one allocation.  That loop is
-// a partial reset, and which fields it covers matters.  It covers six -- the
-// occupying cell, the owning fence group, the utilization accumulator, the
-// validity flag, the hopeless flag and the blocked-layer mask -- and it
-// clears nothing else, so a reused grid carries a padding reservation an
-// earlier pass made and the negotiation engine's capacity, usage and history
-// cost forward untouched.  What this establishes is therefore a clean slate
-// for the diamond legalizer's own view of a pixel rather than for the whole
-// pixel.  Validity is among the six, cleared here and opted back in one site
-// at a time by the row walk in markHopeless(), which is what lets a design
-// whose rows are fragmented leave the gaps between fragments unusable
-// instead of assuming every column of every row exists.  The per-row site
-// maps are emptied and resized in the same breath so no later lookup indexes
-// a row that was never created.
+// is still empty, whereas the loop below runs on every call.  Reuse is
+// narrower than that phrasing suggests, because clear() empties pixels_ and
+// importDb() calls it on the way in.  The detailed-placement and
+// placement-checking entry points import unconditionally, so each of those
+// starts from a fresh allocation; filler and decap placement import only
+// when the network is empty, so those are the passes that reach initGrid()
+// with the vectors still sized and share the earlier allocation.
+// That loop is a partial reset, and which fields it covers matters.  It
+// covers six -- the occupying cell, the owning fence group, the utilization
+// accumulator, the validity flag, the hopeless flag and the blocked-layer
+// mask -- and it clears nothing else, so a reused grid carries a padding
+// reservation an earlier pass made and the negotiation engine's capacity,
+// usage and history cost forward untouched.  What this establishes is
+// therefore a clean slate for the diamond legalizer's own view of a pixel
+// rather than for the whole pixel.  Validity is among the six, cleared here
+// and opted back in one site at a time by the row walk in markHopeless(),
+// which is what lets a design whose rows are fragmented leave the gaps
+// between fragments unusable instead of assuming every column of every row
+// exists.  The per-row site maps are emptied and resized in the same breath
+// so no later lookup indexes a row that was never created.
 void Grid::allocateGrid()
 {
   // Make pixel grid
@@ -956,11 +961,16 @@ bool Grid::cellFitsInCore(Node* cell) const
 // and six all pass that way, on a surviving candidate of two, even though
 // six is no multiple of four -- what the value asserts is that it divides
 // the heights as they were visited, not that they share a pitch.  The
-// first row to fail the test clears the value and stops the walk, and
-// leaving it unset is what forces every vertical conversion onto the
-// tables; the hybrid-row flag beside it is read straight off the sites and
-// is not derived from this test at all.  A design with no usable rows of
-// either kind is a DPL 12 error, since there is nowhere to put anything.
+// first row to fail the test clears the value and stops any further update.
+// What leaving it unset costs is height classification, not coordinate
+// conversion: gridHeight() and isMultiHeight() fall back to the site's row
+// pattern when it is absent, whereas the vertical conversions consult the
+// tables either way, since gridYToDbu() indexes row_index_to_y_dbu_
+// unconditionally.  The hybrid-row flag beside it is read straight off the
+// sites and is not derived from this test at all, so the two answers are
+// independent and a hybrid design whose row heights do divide one another
+// still ends up with a value.  A design with no usable rows of either kind
+// is a DPL 12 error, since there is nowhere to put anything.
 void Grid::examineRows(odb::dbBlock* block)
 {
   block_ = block;
