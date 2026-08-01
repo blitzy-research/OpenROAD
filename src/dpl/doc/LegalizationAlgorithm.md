@@ -1191,7 +1191,6 @@ the function is annotated `// Not called -cherry.`
 (`src/dpl/src/Place.cpp:L526`) and the out-parameter form that yields the target
 corner (`src/dpl/src/Place.cpp:L503`).
 
-
 ## The Site Search
 
 `Opendp::diamondSearch` (`src/dpl/src/Place.cpp:L839-L933`, signature at
@@ -1491,13 +1490,12 @@ search actually visits seven sites before changing row:
   itself is legal, or the first site to either side is, no further candidate is
   ever examined and the ratio never comes into play.
 - **A candidate can be out of bounds.** Every push is guarded by the window test
-  `if (neighbor.x < x_min || neighbor.x > x_max || neighbor.y < y_min || neighbor.y
-  > y_max) { continue; }` (`src/dpl/src/Place.cpp:L921-L924`), against bounds that
-  were derived from the displacement limits
-  (`src/dpl/src/Place.cpp:L844-L847`), narrowed to the cell's fence region if it has
-  one (`src/dpl/src/Place.cpp:L849-L860`), and clipped to the grid
-  (`src/dpl/src/Place.cpp:L862-L866`). A cell near the left or right edge of the
-  core, a cell in a narrow fence region, or any cell run with a small
+  `if (neighbor.x < x_min || neighbor.x > x_max || neighbor.y < y_min || neighbor.y > y_max) { continue; }`
+  (`src/dpl/src/Place.cpp:L921-L924`), against bounds that were derived from the
+  displacement limits (`src/dpl/src/Place.cpp:L844-L847`), narrowed to the cell's
+  fence region if it has one (`src/dpl/src/Place.cpp:L849-L860`), and clipped to
+  the grid (`src/dpl/src/Place.cpp:L862-L866`). A cell near the left or right edge
+  of the core, a cell in a narrow fence region, or any cell run with a small
   `-max_displacement` in `x`, will simply have no seventh site to enqueue — while
   the row above may still be inside the window.
 - **A candidate can already be closed.** Neighbours are marked visited at *enqueue*
@@ -1807,7 +1805,6 @@ flowchart TD
     J -->|yes| Z
     J -->|no| K["7. return drc_engine_-&gt;checkDRC<br/>L1100"]
 ```
-
 
 ## Fallback and Recovery
 
@@ -2524,7 +2521,6 @@ The complete chain, for reference:
 `diamondSearch` (`src/dpl/src/Place.cpp:L839`) → `calcDist` (`src/dpl/src/Place.cpp:L935`) →
 `canBePlaced` (`src/dpl/src/Place.cpp:L942`) → `checkPixels` (`src/dpl/src/Place.cpp:L1009`) →
 `placeCell` (`src/dpl/src/Place.cpp:L1420`) → `setGridLoc` (`src/dpl/src/Place.cpp:L1415`).
-
 
 ## Fence Region (Group) Handling
 
