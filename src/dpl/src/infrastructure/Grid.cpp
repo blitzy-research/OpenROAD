@@ -123,21 +123,27 @@ void Grid::allocateGrid()
 // cell by cell.  The grid begins wholly flagged and each database row
 // subtracts a window around itself sized by the caller's displacement
 // limits; whatever no row ever subtracts stays flagged, and the placer
-// diverts an origin landing there through moveHopeless() instead of
-// searching from it.  Working by subtraction is what makes fragmented and
+// attempts to divert an origin landing there through moveHopeless() rather
+// than search from it.  The attempt can come to nothing: moveHopeless()
+// returns false when none of the four directions it probes holds a pixel
+// that is both valid and unflagged, and its caller then keeps the point it
+// already had.  Working by subtraction is what makes fragmented and
 // staggered rows fall out for free, since no row has to know about any
 // other.
 //
 // The flag is that conservative classification and not an exact statement
 // of unreachability.  The margin applied to those bounds is added on the
 // low side and taken off the high side, so it pulls each subtracted window
-// inward and leaves flagged a rim of start points from which a legal site
-// would in fact still have been within the displacement limits.  That
-// direction is deliberate, for the reason recorded in the comment beside
-// the constant below.  Its units follow the limits it adjusts, which the
-// DPL 5 message states as sites horizontally and rows vertically, so the
-// two axes are not interchangeable even though the arithmetic reads
-// symmetrically.
+// inward and leaves flagged a rim of start points from which the row's own
+// sites would in fact still have been within the displacement limits.  What
+// the geometry settles is reachability of candidate sites and nothing
+// further: whether any of them is legal rests on occupancy, validity,
+// blocked layers, fence-region ownership, padding and the design-rule
+// check, all of which are evaluated per candidate later.  That direction is
+// deliberate, for the reason recorded in the comment beside the constant
+// below.  Its units follow the limits it adjusts, which the DPL 5 message
+// states as sites horizontally and rows vertically, so the two axes are not
+// interchangeable even though the arithmetic reads symmetrically.
 //
 // The flag is read only where an origin is chosen, by legalPt() and
 // moveHopeless() in Place.cpp.  Neither diamondSearch() nor checkPixels()
@@ -299,12 +305,14 @@ void Grid::markBlocked(odb::dbBlock* block)
 // sweep in visitCellPixels() and the reservation painting -- none of which
 // is handed a padding object of its own.  Allocation comes next because
 // both marking passes write pixels directly and cannot run against empty
-// storage -- and it reuses the vectors it already holds, resizing only
-// while they are still empty, so this is a per-pass reset rather than a
-// reallocation.  Obstruction painting comes last because the row walk
-// inside the hopeless marking turns validity on for every site of every
-// row it visits: running it after a blockage had cleared a pixel would
-// quietly undo the blockage.
+// storage -- and whether it allocates or reuses depends on the caller.  The
+// resize runs only while the vectors are empty, so a pass that arrives
+// after importDb() has cleared them allocates afresh, whereas one that
+// arrives with them still sized shares the earlier allocation and gets only
+// the partial per-pixel reset the block above allocateGrid() describes.
+// Obstruction painting comes last because the row walk inside the hopeless
+// marking turns validity on for every site of every row it visits: running
+// it after a blockage had cleared a pixel would quietly undo the blockage.
 //
 // The row tables the allocation is dimensioned from are not built here:
 // examineRows() runs once during database import, well ahead of this,
@@ -772,14 +780,25 @@ GridRect Grid::gridWithin(const DbuRect& rect) const
           .yhi = gridSnapDownY(rect.yh)};
 }
 
-// Floor: the row that contains the coordinate.  Searching the ordered
-// boundary table for the first entry past the coordinate and stepping back
-// one yields the row whose origin the coordinate sits on or above, and a
-// coordinate below the first boundary clamps to row zero instead of
-// underflowing.  This is the conversion for a coordinate that names a
-// position inside a row -- a cell's own row, or the row a point falls in.
-// Takes database units, returns a row index; the two are not related by a
-// constant, which is why this is a table search and not a division.
+// Floor: the largest recorded boundary at or below the coordinate.
+// Searching the ordered boundary table for the first entry past the
+// coordinate and stepping back one yields it, and a coordinate below the
+// first boundary clamps to index zero instead of underflowing.  This is the
+// conversion for a coordinate that names a position inside an interval -- a
+// cell's own row, or the row a point falls in.  Takes database units,
+// returns an index into the row boundary table; the two are not related by
+// a constant, which is why this is a table search and not a division.
+//
+// That index names the containing row only where the interval starting at
+// the boundary is itself a row, and two cases show why the distinction is
+// worth keeping.  A coordinate at or above the final boundary returns the
+// row count itself, which names the grid's top boundary rather than
+// anything occupiable, because the table holds one entry more than there
+// are rows.  And since the grid's rows are the intervals between
+// consecutive boundaries, a design whose rows leave a vertical gap has that
+// gap as an interval too, so a coordinate inside it returns the gap's
+// index -- an interval whose sites the row walk in markHopeless() never
+// validates.
 GridY Grid::gridSnapDownY(DbuY y) const
 {
   auto it = std::upper_bound(  // NOLINT(modernize-use-ranges)
@@ -793,14 +812,22 @@ GridY Grid::gridSnapDownY(DbuY y) const
   return GridY{static_cast<int>(it - row_index_to_y_dbu_.begin())};
 }
 
-// Round: the nearest row origin, which is a different answer from the
-// floor above whenever a coordinate sits in the upper part of a row.  It
-// exists because some callers hold a coordinate that is a request to be
-// snapped rather than a position to be classified, and rounding keeps such
-// a request from being dragged systematically downward by up to a row.  An
-// exact tie goes to the upper row, which keeps the outcome fixed rather
-// than resting on the sign convention of the difference.  Takes database
-// units, returns a row index.
+// Round: the nearest recorded boundary, which is a different answer from
+// the floor above whenever a coordinate sits in the upper part of an
+// interval.  It exists because some callers hold a coordinate that is a
+// request to be snapped rather than a position to be classified, and
+// rounding keeps such a request from being dragged systematically downward
+// by up to a row.  An exact tie goes to the upper boundary, which keeps the
+// outcome fixed rather than resting on the sign convention of the
+// difference.
+//
+// What comes back is a grid-interval origin and not a promise of a usable
+// row, for the same two reasons the floor above carries: rounding upward
+// near the top of the stack can land on the row-count boundary, and in a
+// design whose rows leave a vertical gap it can land on the gap interval's
+// origin.  Which of those the answer is gets settled by the validity checks
+// the placement predicate applies afterwards, never here.  Takes database
+// units, returns an index into the row boundary table.
 GridY Grid::gridRoundY(DbuY y) const
 {
   const auto grid_y = gridSnapDownY(y);
@@ -814,18 +841,20 @@ GridY Grid::gridRoundY(DbuY y) const
   return grid_y;
 }
 
-// Exclusive end: the index of the first recorded boundary at or past the
-// coordinate, meant as a loop bound rather than as a row to occupy.  Three
-// kinds of answer come back and they are worth keeping apart.  A coordinate
-// inside the stack of rows yields an index some row also carries, anywhere
-// from zero up to one below the row count.  A coordinate at the top edge of
-// the topmost row yields the index equal to the row count itself: that
-// entry is the top boundary of the grid rather than a row anything can
-// occupy, which is exactly what an exclusive bound wants.  A coordinate
-// past every recorded boundary yields one index further still, one past the
-// end of the boundary table, and that value is deliberately accepted by the
-// reverse conversion below, which maps it to the top of the core -- so
-// bracketing a span never needs a special case at the top of the grid.
+// Exclusive end: the index of the first recorded boundary at or above the
+// coordinate, meant as a loop bound rather than as a row to occupy.  That
+// lower-bound contract is the whole specification, and reading it exactly
+// matters.  A coordinate sitting on a boundary yields that boundary's own
+// index; a coordinate strictly between two boundaries yields the upper one.
+// So a coordinate anywhere above the topmost row's origin, up to and
+// including that row's top edge, yields the index equal to the row count --
+// an interior coordinate, not only an exact top edge, reaches that value.
+// The entry there is the top boundary of the grid rather than a row
+// anything can occupy, which is exactly what an exclusive bound wants.  A
+// coordinate past every recorded boundary yields one index further still,
+// one past the end of the boundary table, and that value is deliberately
+// accepted by the reverse conversion below, which maps it to the top of the
+// core -- so bracketing a span never needs a special case at the top.
 // A floor, a round and an exclusive end are three different answers for one
 // coordinate, and substituting either for another is an off-by-one waiting
 // to happen, which is why all three exist side by side.  Takes database
@@ -850,9 +879,11 @@ GridY Grid::gridSnapDownY(const Node* cell) const
   return gridSnapDownY(cell->getBottom());
 }
 
-// Snaps the cell's bottom edge to the nearest row rather than the row
-// containing it, for callers holding a position that is not legal yet and
-// wanting the closest row instead of the one below it.
+// Rounds the cell's bottom edge instead of flooring it, for callers holding
+// a position that is not legal yet and wanting the closest boundary rather
+// than the one below it.  It delegates to the coordinate form above and so
+// inherits its answer exactly: the nearest recorded boundary, which is the
+// origin of a grid interval and not necessarily a row a cell may occupy.
 GridY Grid::gridRoundY(const Node* cell) const
 {
   return gridRoundY(cell->getBottom());
@@ -883,12 +914,17 @@ GridY Grid::gridRoundY(const Node* cell) const
 // unweighted.  calcDist() sums a horizontal term scaled by site width with
 // a vertical term taken from here, both in database units.  Because the
 // two axes are resolved by different means, one row of vertical travel
-// costs as much as row height over site width sites of horizontal travel:
-// the search spreads far more readily sideways than upward, and its
-// equal-cost contour is a diamond in database units only, never on the
-// pixel grid.  Takes a row index, returns database units; the typed
-// coordinate wrappers make confusing the two a compile error rather than a
-// silent scale bug.
+// costs as much as row height over site width sites of horizontal travel.
+// That ratio, and not a fixed preference, is what decides which way the
+// search spreads: with the row heights and site widths an ordinary
+// standard-cell library declares the ratio is well above one, so a great
+// deal of sideways travel is bought for the price of a single row, and the
+// equal-cost contour is a diamond in database units while being a
+// correspondingly flattened one on the pixel grid.  Were a design's row
+// height to equal its site width the ratio would be one and the two grid
+// axes would weigh the same.  Takes a row index, returns database units;
+// the typed coordinate wrappers make confusing the two a compile error
+// rather than a silent scale bug.
 DbuY Grid::gridYToDbu(GridY y) const
 {
   if (y == row_index_to_y_dbu_.size()) {

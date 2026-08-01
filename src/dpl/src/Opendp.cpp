@@ -572,8 +572,10 @@ void Opendp::deleteGrid()
 // R-tree because this sits on the innermost path of the site search: the
 // legality predicate consults checkRegionOverlap for every candidate site
 // it examines, so a linear scan over regions would cost the search a
-// factor of the region count. The tree is built once when the network is
-// created and is queried nowhere else.
+// factor of the region count. The tree is built once during database
+// import, by setUpPlacementGroups(), which runs after the separate
+// createNetwork() and createArchitecture() calls rather than as part of
+// either; here is the only place it is ever queried.
 //
 // The result vector belongs to the caller and is cleared on entry rather
 // than appended to, so the same storage can legitimately be handed back

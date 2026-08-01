@@ -338,14 +338,19 @@ CellPlaceOrderLess::CellPlaceOrderLess(const odb::Rect& core,
 // each other, so an unweighted offset from the core centre is enough.
 //
 // What it measures is the cell's lower-left corner and not the cell's own
-// centre, so the value differs from a true centre offset by half the cell's
-// width and half its height.  The sign of that shift depends on where the
-// cell lies rather than on how wide it is: a cell to the right of or above
-// the core centre scores nearer than a measurement from its own centre
-// would give, while one to the left of or below the centre scores farther.
-// The difference is bounded by half the cell's own footprint, and this is
-// only the third of the four keys below, so it reorders nothing the
-// row-span and area keys have already separated.
+// centre, so the value differs from a true centre offset by up to half the
+// cell's width and half its height.  Which way it differs is settled per
+// axis by whether that half-footprint carries the cell's centre past the
+// core centre.  With the corner already at or beyond the core centre the
+// corner measure scores nearer than a centre measure would by exactly half
+// the footprint; with the whole half-footprint still short of the centre it
+// scores farther by the same amount.  Between those, where the corner is
+// short of the core centre but the centre has crossed it, the gap narrows
+// and reverses, vanishing where the corner sits a quarter of the footprint
+// short.  So the shift is bounded by half the cell's own footprint but is
+// not a fixed function of which side the corner lies on.  This is also only
+// the third of the four keys below, so it reorders nothing the row-span and
+// area keys have already separated.
 int CellPlaceOrderLess::centerDist(const Node* cell) const
 {
   return sumXY(abs(cell->getLeft() - center_x_),
@@ -796,25 +801,31 @@ void Opendp::deepIterativePause(const std::string& message, bool only_print)
 
 // The recovery path, reached only after a diamond search has exhausted its
 // entire displacement window.  It evicts a bounded neighbourhood instead
-// of re-solving the placement, so the cost of one failure stays roughly
-// constant and the work already committed elsewhere survives; the price is
-// a bounded amount of local quality.  The window reaches three rows above
-// and below the target and, horizontally, four times the target's padded
-// width in sites to either side, that factor being derived from the row
-// margin so the two extents stay coupled rather than independently tuned.
+// of re-solving the placement, so the work already committed elsewhere
+// survives and the cost of one failure stays local rather than global; the
+// price is a bounded amount of local quality.  Local is not the same as
+// fixed: the window widens with the target's padded width, how much work it
+// takes scales with how many non-fixed cells that window happens to hold,
+// and every one of them then pays for a search of its own across its
+// configured displacement limits.  The window reaches three rows above and
+// below the target and, horizontally, four times the target's padded width
+// in sites to either side, that factor being derived from the row margin so
+// the two extents stay coupled rather than independently tuned.
 // Eviction is filtered on fence-region membership as a boolean, not on
 // region identity: the test asks only whether target and neighbour are
 // both in some region or both in none, so a grouped target may well evict
 // a cell belonging to a different region, while a grouped and an ungrouped
-// cell never disturb each other.  Nothing is lost by that, because each
-// evicted cell is re-placed by its own diamondMove(), whose window is
-// clipped to that cell's own region and whose legality predicate confines
-// it there as well, so a neighbour pulled out of a different region is
-// still put back inside that region.  Note that the collection is a
-// std::set of pointers, so eviction and re-placement order follows heap
-// addresses and may differ between runs; the note above its call site in
-// place() already records this.  A neighbour that cannot be put back fails
-// the call just as the target cell does.
+// cell never disturb each other.  Crossing a region that way does not let a
+// cell out of it, because each evicted cell is re-placed by its own
+// diamondMove(), whose window is clipped to that cell's own region and whose
+// legality predicate confines it there as well; so where a neighbour pulled
+// out of a different region is placed again, it is placed inside that same
+// region.  Where it cannot be placed again it is recorded in
+// placement_failures_ and fails the call, exactly as the target cell does,
+// which is the sense in which eviction is not free.  Note also that the
+// collection is a std::set of pointers, so eviction and re-placement order
+// follows heap addresses and may differ between runs; the note above its
+// call site in place() already records this.
 bool Opendp::ripUpAndReplace(Node* target_cell)
 {
   const GridPt taget_cell_pixel = legalGridPt(target_cell, true);
@@ -1811,11 +1822,13 @@ void Opendp::placeCell(Node* cell, const GridX x, const GridY y)
 // their pixels are the obstruction map every search depends on.  The held
 // flag is cleared alongside the placed flag, so a cell a pre-placement
 // pass had pinned becomes an ordinary candidate again once it is lifted.
-// The journal entry, when a caller has installed one, is written before the
-// pixels are erased, so it still carries the hold state the erase is about
-// to discard.  Like the commit above it is bookkeeping for that caller
-// rather than a mechanism the fallback relies on: ripUpAndReplace() calls
-// this and then searches again, and it does so with no journal installed.
+// The journal entry, when a caller has installed one, is written ahead of
+// every state change below, so it still carries the hold state that the last
+// of them clears; the pixel erase in between changes pixel ownership only
+// and leaves that flag alone.  Like the commit above it is bookkeeping for
+// that caller rather than a mechanism the fallback relies on:
+// ripUpAndReplace() calls this and then searches again, and it does so with
+// no journal installed.
 // What actually lets that path evict and still recover is
 // Grid::erasePixel() clearing only the entries this cell owns, which leaves
 // every neighbour's pixels intact for the re-placement attempt that

@@ -550,22 +550,32 @@ Node* Opendp::checkOneSiteGaps(Node& cell) const
   return gap_cell;
 }
 
-// Both conditions are required and neither implies the other.  contains()
-// asks only whether the rectangle of the region this cell was assigned to
-// covers the cell, which says nothing about any other region; the R-tree
-// test inside checkRegionOverlap additionally demands that the cell's box
-// overlap exactly one region rectangle and be covered by it, and that is
-// what rules out a cell straddling two adjacent regions or protruding from
-// its own region into open core.  A cell can satisfy either test alone and
-// still be illegally placed.
+// Both conditions are required and neither implies the other, and the two
+// carry different responsibilities.  contains() compares the cell's exact
+// database-unit rectangle against the single rectangle this cell was
+// assigned, so it is what refuses a cell protruding out of that rectangle
+// at all -- into open core or into anything else -- and it says nothing
+// about any other region.  The R-tree test inside checkRegionOverlap asks a
+// different question of a different set: it queries the index holding every
+// region rectangle in the design, demands exactly one hit, and demands that
+// the hit cover the box.  So what it adds is the refusal of a candidate
+// whose box reaches a second region rectangle, and a coverage test carried
+// out on other geometry -- a box rebuilt from grid indices, against
+// rectangles the index holds one database unit short on each upper edge.  A
+// cell can satisfy either test alone and still be illegally placed.
 //
 // The extents computed here are in database units, while the four
 // arguments handed to checkRegionOverlap are grid indices.  Observed
-// characteristic: the two Y indices are formed by dividing by the cell's
-// own height rather than by consulting the row table, so they agree with
-// Grid::gridYToDbu - the hybrid-row-aware conversion checkRegionOverlap
-// uses to turn them back into database units - only for a single-row cell
-// in a design whose rows all share one height.
+// characteristic: the two Y indices are formed by dividing by the cell's own
+// height rather than by consulting the row table, so each is a count of that
+// height and lines up with Grid::gridYToDbu - the hybrid-row-aware
+// conversion checkRegionOverlap uses to turn them back into database
+// units - only where the quotient happens to land on the same recorded
+// boundary.  For a single-row cell in a design whose rows all share one
+// height, and whose stack starts at the core bottom, that holds throughout;
+// in a design mixing row heights it holds where the arithmetic coincides and
+// not otherwise; and for a multi-row cell, whose height spans several
+// boundaries, it generally does not hold at all.
 //
 // A cell with no region is legal here unconditionally, because region
 // placement constrains only cells that were assigned one.  The converse
