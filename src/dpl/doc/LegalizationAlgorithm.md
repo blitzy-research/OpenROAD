@@ -3611,7 +3611,7 @@ translation unit includes that header, and the `dpl` line that calls it.
 | `<queue>`, included at `src/dpl/src/Place.cpp:L13` | `std::priority_queue`, instantiated as the frontier at `src/dpl/src/Place.cpp:L891-L892` |
 | `<functional>`, included at `src/dpl/src/Place.cpp:L10` | `std::greater`, the comparator argument that makes that queue a min-heap (`src/dpl/src/Place.cpp:L891`) |
 | `<unordered_set>`, included at `src/dpl/src/Place.cpp:L18` | `std::unordered_set`, the closed set at `src/dpl/src/Place.cpp:L893` |
-| `<set>`, included at `src/dpl/src/Place.cpp:L15` | `std::set`, the pointer-ordered rip-up container at `src/dpl/src/Place.cpp:L689` — recorded as **D2** |
+| `<set>`, included at `src/dpl/src/Place.cpp:L15` | `std::set`, the pointer-ordered rip-up container at `src/dpl/src/Place.cpp:L689` — recorded as item 1 of [Known Gotchas, Determinism, and Limitations](#known-gotchas-determinism-and-limitations) |
 | `src/dpl/src/NegotiationLegalizer.h:L253` | `die_xlo_`, with `die_ylo_` at `L254` — the core rectangle minima the optional engine adds back when converting its grid coordinates |
 | `src/dpl/src/NegotiationLegalizer.h:L272` | `run_abacus_` |
 

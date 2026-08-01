@@ -181,6 +181,29 @@ def setup(app):
         swap_prefix(filename, "(docs/", "(../")
         swap_prefix(filename, "```mermaid", "```{mermaid}\n:align: center\n")
 
+    # src/dpl/README.md is deliberately absent from the list above, because the
+    # unconditional "(../" swap would corrupt its parent-relative links to the
+    # repository README and LICENSE. Its two links into the dpl deep dive are
+    # therefore mapped one at a time, from the GitHub-native repository-relative
+    # spelling to a reference sphinx can resolve through the "main" symlink. The
+    # anchored one needs a target inside the deep dive, because a document
+    # reference cannot carry a fragment. revert-links.py reverses all three.
+    swap_prefix(
+        "../src/dpl/doc/LegalizationAlgorithm.md",
+        "\n## Known Gotchas, Determinism, and Limitations\n",
+        "\n(dpl-known-gotchas)=\n## Known Gotchas, Determinism, and Limitations\n",
+    )
+    swap_prefix(
+        "../src/dpl/README.md",
+        "](doc/LegalizationAlgorithm.md#known-gotchas-determinism-and-limitations)",
+        "](#dpl-known-gotchas)",
+    )
+    swap_prefix(
+        "../src/dpl/README.md",
+        "](doc/LegalizationAlgorithm.md)",
+        "](doc/LegalizationAlgorithm)",
+    )
+
     # for populating OR Messages page.
     command = "python getMessages.py"
     _ = os.popen(command).read()
