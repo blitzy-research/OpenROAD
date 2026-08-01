@@ -122,16 +122,16 @@ near the end (`test/flow.tcl:L248`).
 ```mermaid
 flowchart LR
     GP["Global placement<br/>minimizes wirelength<br/>ignores the site grid<br/>test/flow.tcl:L61"]
-    DPL["dpl legalization<br/>Opendp::detailedPlacement<br/>Opendp.cpp:L116<br/>invoked at test/flow.tcl:L90, L119, L157"]
+    DPL["dpl legalization<br/>Opendp::detailedPlacement<br/>src/dpl/src/Opendp.cpp:L116<br/>invoked at test/flow.tcl:L90, L119, L157"]
     CTS["Clock-tree synthesis<br/>test/flow.tcl:L111<br/>then routing and the rest of the flow"]
     LATE["Later stages, e.g. filler_placement<br/>test/flow.tcl:L247"]
-    CHK["Opendp::checkPlacement<br/>CheckPlacement.cpp:L27-L138<br/>a separate verifier reached only through<br/>the check_placement command;<br/>detailedPlacement never calls it"]
+    CHK["Opendp::checkPlacement<br/>src/dpl/src/CheckPlacement.cpp:L27-L138<br/>a separate verifier reached only through<br/>the check_placement command;<br/>detailedPlacement never calls it"]
 
     GP -->|"overlapping cells at<br/>arbitrary coordinates"| DPL
     DPL -->|"intended result: every movable std cell<br/>site-aligned, in a valid row, overlap-free,<br/>padding and edge-spacing clean,<br/>power-rail compatible"| CTS
     CTS --> LATE
     LATE -. "operator issues check_placement -verbose<br/>test/flow.tcl:L248" .-> CHK
-    DPL -->|"minimize displacement<br/>Opendp::disp<br/>Opendp.cpp:L387-L391"| DPL
+    DPL -->|"minimize displacement<br/>Opendp::disp<br/>src/dpl/src/Opendp.cpp:L387-L391"| DPL
 ```
 
 ## The Legality Invariant
@@ -321,7 +321,7 @@ rather than to the detection nodes.
 
 ```mermaid
 flowchart TD
-    A["checkPlacement<br/>CheckPlacement.cpp:L27"] --> B["importDb, adjustNodesOrient<br/>L30-L31"]
+    A["checkPlacement<br/>src/dpl/src/CheckPlacement.cpp:L27"] --> B["importDb, adjustNodesOrient<br/>L30-L31"]
     B --> C["declare 9 failure vectors<br/>L33-L41"]
     C --> D["initGrid, groupAssignCellRegions<br/>L43-L44"]
     D --> E["LOOP 1: for each node in the network<br/>L46-L85<br/>DETECTION ONLY, emits nothing"]
@@ -1345,7 +1345,7 @@ returns a default-constructed result — `return PixelPt();`
 
 ```mermaid
 flowchart TD
-    A["diamondSearch(cell, x, y)<br/>Place.cpp:L839"] --> B["compute and clamp bounds<br/>L844-L866"]
+    A["diamondSearch(cell, x, y)<br/>src/dpl/src/Place.cpp:L839"] --> B["compute and clamp bounds<br/>L844-L866"]
     B --> C["seed heap with origin, distance 0<br/>L896-L897<br/>visited.insert(center), L898"]
     C --> D{"heap empty?<br/>L904"}
     D -->|yes| E["return PixelPt()<br/>pixel is null<br/>L932"]
@@ -1789,7 +1789,7 @@ this function itself contains. Recorded as **D10** in
 
 ```mermaid
 flowchart TD
-    A["canBePlaced(cell, bin_x, bin_y)<br/>Place.cpp:L942"] --> B{"bin_y &gt;= getRowCount?<br/>L953"}
+    A["canBePlaced(cell, bin_x, bin_y)<br/>src/dpl/src/Place.cpp:L942"] --> B{"bin_y &gt;= getRowCount?<br/>L953"}
     B -->|yes| Z["reject"]
     B -->|no| C["x_end = bin_x + gridWidth, L957<br/>y_end via gridYToDbu + height, L958-L959"]
     C --> D["checkPixels<br/>L964 calls L1009"]
@@ -2265,7 +2265,7 @@ never runs the verifier.
 
 ```mermaid
 flowchart TD
-    A["detailedPlacement<br/>Opendp.cpp:L116"] --> B{"max_displacement_x == 0<br/>OR max_displacement_y == 0?<br/>L171"}
+    A["detailedPlacement<br/>src/dpl/src/Opendp.cpp:L116"] --> B{"max_displacement_x == 0<br/>OR max_displacement_y == 0?<br/>L171"}
     B -->|either is zero| C["x = 500 sites, L172<br/>y = 100 rows, L173<br/>BOTH replaced"]
     B -->|both non-zero| D["use both as given<br/>L174-L176"]
     C --> E["DPL 5: +/- N sites horizontally,<br/>+/- N rows vertically<br/>L179-L184"]
@@ -2282,7 +2282,7 @@ flowchart TD
     K2 -->|yes| K4["DPL 36 error, L204<br/>run stops; the partial<br/>placement is already in OpenDB"]
     K3 --> K4
     F -->|no, optional| L["initGrid L207, setFixedGridCells L208<br/>region-guarded group pixels L211-L214<br/>DPL 1102, L215"]
-    L --> M["NegotiationLegalizer L217-L222<br/>setRunAbacus L223<br/>legalize L224: flushToDb ALREADY<br/>wrote the DB, NegotiationLegalizer.cpp:L306<br/>setDplPositions L225"]
+    L --> M["NegotiationLegalizer L217-L222<br/>setRunAbacus L223<br/>legalize L224: flushToDb ALREADY<br/>wrote the DB, src/dpl/src/NegotiationLegalizer.cpp:L306<br/>setDplPositions L225"]
     M --> N{"numViolations &gt; 0?<br/>L227"}
     N -->|yes| O["DPL 701 warning L228-L232<br/>metric NL__no__converge__final_violations<br/>L233-L234"]
     N -->|no| P["findDisplacementStats L237<br/>baseline REBASED by the earlier write<br/>updateDbInstLocations L238"]
@@ -2338,7 +2338,7 @@ any cell moves:
 
 ```mermaid
 flowchart TD
-    A["diamondDPL<br/>Place.cpp:L62"] --> B["observer startPlacement, optional<br/>L64-L66"]
+    A["diamondDPL<br/>src/dpl/src/Place.cpp:L62"] --> B["observer startPlacement, optional<br/>L64-L66"]
     B --> C["placement_failures_.clear()<br/>L68"]
     C --> D["initGrid()<br/>L69"]
     D --> E["setFixedGridCells()<br/>L71, under 'Paint fixed cells.' L70"]
@@ -3212,7 +3212,8 @@ to its definition line at pin `4bc0d66972`. The first four sub-sections take the
 four files that contribute the most entries and list those entries by line;
 **Other files** holds the landmark ordering and optional-engine sites;
 **Routines named in supporting files** holds everything else the path reaches,
-including the `odb`, `utl` and Boost.Geometry routines the document names;
+including the `odb`, `utl`, Boost.Geometry and Boost.ICL routines the document
+names;
 **Standard library callables** holds the `std` routines, which have no definition
 line here and are therefore given by declaring header, include site and call site;
 and **Key type declarations** holds the types and the named data members,
@@ -3416,8 +3417,8 @@ optional-engine helpers the legalization path reaches, then the routines it name
 outside this module. None is defined in the four files tabulated by line above;
 where a file also appears under **Other files**, that sub-section records a
 landmark ordering and this one records the routines. Ordered by file, then by
-line, with the entries from outside `dpl` — `odb`, `utl` and Boost.Geometry —
-last.
+line, with the entries from outside `dpl` — `odb`, `utl`, Boost.Geometry and
+Boost.ICL — last.
 
 | Location | Definition |
 |---|---|
@@ -3426,25 +3427,30 @@ last.
 | `src/dpl/src/infrastructure/Objects.cpp:L108` | `Node::getBottom` |
 | `src/dpl/src/infrastructure/Objects.cpp:L120` | `Node::getWidth` |
 | `src/dpl/src/infrastructure/Objects.cpp:L124` | `Node::getHeight` |
+| `src/dpl/src/infrastructure/Objects.cpp:L136` | `Node::getDbInst` — the database handle `initialLocation` reads the pre-legalization position through, at `src/dpl/src/Place.cpp:L1352` (declared at `src/dpl/src/infrastructure/Objects.h:L82`) |
 | `src/dpl/src/infrastructure/Objects.cpp:L154` | `Node::isFixed` |
 | `src/dpl/src/infrastructure/Objects.cpp:L158` | `Node::isPlaced` |
+| `src/dpl/src/infrastructure/Objects.cpp:L219` | `Node::getType` — the movability filter the placement pass compares against `Node::CELL` (declared at `src/dpl/src/infrastructure/Objects.h:L95`) |
 | `src/dpl/src/infrastructure/Objects.cpp:L231` | `Node::isStdCell` — the tier filter of the invariant's per-cell loop (declared at `src/dpl/src/infrastructure/Objects.h:L98`) |
 | `src/dpl/src/infrastructure/Objects.cpp:L243` | `Node::getGroup` |
 | `src/dpl/src/infrastructure/Objects.cpp:L247` | `Node::getRegion` |
 | `src/dpl/src/infrastructure/Objects.cpp:L251` | `Node::getMaster` |
 | `src/dpl/src/infrastructure/Objects.cpp:L255` | `Node::inGroup` |
+| `src/dpl/src/infrastructure/Objects.cpp:L280` | `Node::setId` — gives each node its container index at network construction, at `src/dpl/src/infrastructure/network.cxx:L383-L384`, which is why the identifiers follow the name-ordered traversal (declared at `src/dpl/src/infrastructure/Objects.h:L112`) |
 | `src/dpl/src/infrastructure/Objects.cpp:L296` | `Node::setLeft` |
 | `src/dpl/src/infrastructure/Objects.cpp:L300` | `Node::setBottom` |
 | `src/dpl/src/infrastructure/Objects.cpp:L483` | `Group::getRects` |
 | `src/dpl/src/infrastructure/Objects.cpp:L487` | `Group::getCells` |
 | `src/dpl/src/infrastructure/Objects.cpp:L491` | `Group::getBBox` |
 | `src/dpl/src/infrastructure/Objects.cpp:L515` | `Group::addCell` — fills the group's cell vector in database iteration order (declared at `src/dpl/src/infrastructure/Objects.h:L185`) |
+| `src/dpl/src/infrastructure/Objects.cpp:L519` | `Group::setBoundary` — stores the merged region rectangle into `Group::boundary_`, at `src/dpl/src/dbToOpendp.cpp:L469` (declared at `src/dpl/src/infrastructure/Objects.h:L186`) |
 | `src/dpl/src/infrastructure/Padding.cpp:L93` | `Padding::padLeft` (cell overload) |
 | `src/dpl/src/infrastructure/Padding.cpp:L98` | `Padding::padLeft` (instance overload) |
 | `src/dpl/src/infrastructure/Padding.cpp:L114` | `Padding::padRight` (cell overload) |
 | `src/dpl/src/infrastructure/Padding.cpp:L119` | `Padding::padRight` (instance overload) |
 | `src/dpl/src/infrastructure/Padding.cpp:L135` | `Padding::paddedWidth` |
 | `src/dpl/src/infrastructure/architecture.h:L36` | `Architecture::getRegions` |
+| `src/dpl/src/infrastructure/architecture.h:L108` | `Architecture::Row::setId` — renumbers the rows *after* the second stable sort, at `src/dpl/src/infrastructure/architecture.cxx:L214-L217`, which is why a row index is a function of geometry rather than of database order (class `Architecture::Row` at `L98`) |
 | `src/dpl/src/infrastructure/architecture.h:L124` | `Architecture::Row::getBottom` — the key the row stable sort projects on (class `Architecture::Row` at `L98`) |
 | `src/dpl/src/infrastructure/architecture.cxx:L83` | `Architecture::createAndAddRow` (declared at `src/dpl/src/infrastructure/architecture.h:L34`) |
 | `src/dpl/src/infrastructure/architecture.cxx:L100` | `Architecture::postProcess` |
@@ -3491,6 +3497,7 @@ last.
 | `src/dpl/src/NegotiationLegalizerPass.cpp:L746` | `NegotiationLegalizer::greedyImprove` |
 | `src/odb/include/odb/db.h:L779` | `dbBlock::findInst` — cited only to establish that an instance name identifies one instance |
 | `src/odb/include/odb/db.h:L2820` | `odb::dbInst::getLocation` — the store `initialLocation` reads, which is why a re-placement starts from the global-placement position (class `dbInst` at `L2674`) |
+| `src/odb/include/odb/db.h:L2832` | `odb::dbInst::setLocation` — the write-back both engines issue: `updateDbInstLocations` at `src/dpl/src/Opendp.cpp:L256` and the optional engine's `flushToDb` at `src/dpl/src/NegotiationLegalizer.cpp:L386` |
 | `src/odb/include/odb/db.h:L2979` | `odb::dbInst::getMaster` |
 | `src/odb/include/odb/db.h:L4952` | `odb::dbRow::getOrigin` (class `dbRow` at `L4931`) |
 | `src/odb/include/odb/db.h:L4957` | `odb::dbRow::getOrient` — the per-row orientation the interval map stores |
@@ -3507,6 +3514,7 @@ last.
 | `src/odb/include/odb/geom.h:L369` | `odb::Rect::yMin` |
 | `src/odb/include/odb/geom.h:L370` | `odb::Rect::xMax` |
 | `src/odb/include/odb/geom.h:L371` | `odb::Rect::yMax` |
+| `src/odb/include/odb/geom.h:L428` | `odb::Rect::merge(const Rect&)` — declared in `Rect`, defined inline at `src/odb/include/odb/geom.h:L804`; accumulates each region rectangle into the group boundary at `src/dpl/src/dbToOpendp.cpp:L467` |
 | `src/odb/include/odb/util.h:L28` | `odb::hasOneSiteMaster` — the library probe the one-site-gap member is derived from, defined at `src/odb/src/db/util.cpp:L345` |
 | `src/odb/src/db/dbInst.cpp:L324` | `odb::dbInst::getName` |
 | `src/odb/src/db/dbInst.cpp:L330` | `odb::dbInst::getConstName` — the value the fourth ordering key compares |
@@ -3519,6 +3527,7 @@ last.
 | `src/utl/include/utl/Logger.h:L384` | `debugPrint` — the logging macro |
 | Boost.Geometry — no repository definition | `boost::geometry::index::intersects` — the R-tree predicate `findOverlapInRtree` queries with, at `src/dpl/src/Opendp.cpp:L428` |
 | Boost.Geometry — no repository definition | `boost::geometry::covered_by` — the header is included at `src/dpl/src/Place.cpp:L22` and the call is at `src/dpl/src/Place.cpp:L997` |
+| Boost.ICL — no repository definition | `boost::icl::interval_map::add` — the insert that builds a row's valid-site spans, one span per fragmented-row segment together with that row's own orientation; the header is included at `src/dpl/src/infrastructure/Grid.h:L18` and the call is at `src/dpl/src/infrastructure/Grid.cpp:L122-L123` |
 
 ### Standard library callables
 
@@ -3539,10 +3548,12 @@ translation unit includes that header, and the `dpl` line that calls it.
 | `std::vector::size` | `<vector>` | `src/dpl/src/infrastructure/Grid.h:L14`, `src/dpl/src/Place.cpp:L19` | `src/dpl/src/infrastructure/Grid.cpp:L666` (the sentinel-index test) and `src/dpl/src/Place.cpp:L391` |
 | `std::vector::clear` | `<vector>` | `src/dpl/src/Place.cpp:L19` | `src/dpl/src/Place.cpp:L68` — resets `placement_failures_` at the start of a run |
 | `std::vector::empty` | `<vector>` | `src/dpl/src/Place.cpp:L19` | `src/dpl/src/Place.cpp:L82` (are there regions?) and `src/dpl/src/Place.cpp:L1005` (the R-tree result) |
+| `std::vector::push_back` | `<vector>` | `src/dpl/src/Place.cpp:L19` | `src/dpl/src/Place.cpp:L725` and `src/dpl/src/Place.cpp:L745` — the only two writes to `placement_failures_`, one for the cell the rip-up could not re-place and one per evicted neighbour that could not be put back |
 | `std::unordered_set::insert` | `<unordered_set>` | `src/dpl/src/Place.cpp:L18` | `src/dpl/src/Place.cpp:L898` (seeding the closed set) and `src/dpl/src/Place.cpp:L926` (enqueue-time marking) |
 | `std::priority_queue::top` | `<queue>` | `src/dpl/src/Place.cpp:L13` | `src/dpl/src/Place.cpp:L905` |
 | `std::priority_queue::pop` | `<queue>` | `src/dpl/src/Place.cpp:L13` | `src/dpl/src/Place.cpp:L906` |
 | `std::optional::value` | `<optional>` | `src/dpl/src/infrastructure/Grid.h:L11` | `src/dpl/src/Place.cpp:L1084` — unwraps the site orientation |
+| `std::unique_ptr::get` | `<memory>` | `src/dpl/src/Place.cpp:L12` | `src/dpl/src/Place.cpp:L767` — hands the raw `Grid*` held by `grid_` to the local `Journal` that `swapCells` builds |
 
 ### Key type declarations
 
@@ -3610,6 +3621,7 @@ translation unit includes that header, and the `dpl` line that calls it.
 | `src/odb/include/odb/dbTypes.h:L25` | `class dbOrientType` — the orientation enumeration the symmetry switch runs over |
 | `<queue>`, included at `src/dpl/src/Place.cpp:L13` | `std::priority_queue`, instantiated as the frontier at `src/dpl/src/Place.cpp:L891-L892` |
 | `<functional>`, included at `src/dpl/src/Place.cpp:L10` | `std::greater`, the comparator argument that makes that queue a min-heap (`src/dpl/src/Place.cpp:L891`) |
+| `<functional>`, included at `src/dpl/src/infrastructure/architecture.cxx:L9` | `std::less`, named explicitly by the first row sort only so that a projection can be supplied after it (`src/dpl/src/infrastructure/architecture.cxx:L115`) |
 | `<unordered_set>`, included at `src/dpl/src/Place.cpp:L18` | `std::unordered_set`, the closed set at `src/dpl/src/Place.cpp:L893` |
 | `<set>`, included at `src/dpl/src/Place.cpp:L15` | `std::set`, the pointer-ordered rip-up container at `src/dpl/src/Place.cpp:L689` — recorded as item 1 of [Known Gotchas, Determinism, and Limitations](#known-gotchas-determinism-and-limitations) |
 | `src/dpl/src/NegotiationLegalizer.h:L253` | `die_xlo_`, with `die_ylo_` at `L254` — the core rectangle minima the optional engine adds back when converting its grid coordinates |

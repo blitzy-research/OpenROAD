@@ -77,10 +77,9 @@ Global Placement result
 └────────┬──────────┘
          │
          ▼
-   Cell positions written back to OpenDB
-   (DPL-0701 warns when violations remain)
+   Legal placement written back to OpenDB
 ```
-## Commands
+# Commands
 
 ```{note}
 - Parameters in square brackets `[-param param]` are optional.
