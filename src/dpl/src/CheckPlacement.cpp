@@ -37,17 +37,20 @@ using utl::format_as;  // NOLINT(misc-unused-using-decls)
 // is reported under its own message identifier rather than collapsed into
 // a single unattributable error, and the mapping from check to identifier
 // is stable across runs.  The number alone is not unique module-wide,
-// though: two of the nine are also used by informational messages emitted
-// earlier in detailed placement - 5 for the displacement limits and 6 for
-// the utilization report, both in Opendp.cpp - so a log search on one of
-// those two numbers needs the warning level and the check name carried in
-// the message text to tell a violation apart from an informational line.
-// The other seven - 3, 4, 7, 8, 9, 10 and 11 - are used nowhere else in
-// the module.  initGrid() and groupAssignCellRegions() must run before the
-// loop because every per-cell test below but one reads either the pixel
-// grid or a cell's assigned region, and neither exists until they do.  The
-// placed check is that one exception: it reads the instance's own status
-// and depends on neither.
+// though: four of the nine are shared with other messages in this module.
+// 5 and 6 also carry the informational lines detailed placement emits
+// earlier for the displacement limits and for the utilization report, both
+// in Opendp.cpp; there the level separates them, INFO against the warning
+// reportFailures() raises below.  3 and 4 also carry the warnings the Tcl
+// layer emits for the deprecated -disallow_one_site_gaps flag, on
+// detailed_placement and on check_placement respectively, in Opendp.tcl;
+// those are warnings as well, so only the message text separates them from
+// a violation.  The remaining five - 7, 8, 9, 10 and 11 - are used nowhere
+// else in the module.  initGrid() and groupAssignCellRegions() must run
+// before the loop because every per-cell test below but one reads either
+// the pixel grid or a cell's assigned region, and neither exists until
+// they do.  The placed check is that one exception: it reads the
+// instance's own status and depends on neither.
 //
 // The order inside the per-cell loop is forced, not incidental:
 //   - Site alignment comes first and is the only check that abandons the
