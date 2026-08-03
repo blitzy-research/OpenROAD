@@ -79,7 +79,7 @@ Global Placement result
          ▼
    Legal placement written back to OpenDB
 ```
-## Commands
+# Commands
 
 ```{note}
 - Parameters in square brackets `[-param param]` are optional.

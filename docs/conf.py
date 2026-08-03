@@ -160,8 +160,32 @@ def swap_prefix(file, old, new):
         f.write(lines)
 
 
+# Module READMEs whose heading levels are frozen on disk (the manpage
+# translator in src/scripts/md_roff_compat.py parses the file directly) but
+# which open a second document-level section with "# ". A page with two
+# top-level sections has no single section for docutils to promote to the
+# document title, and Sphinx then applies neither the toc.yml title override
+# nor the nested toc.yml children to the sidebar entry for that page, so the
+# child pages listed under it become unreachable from site navigation.
+# Demoting the second heading as the source is read keeps the file on disk
+# byte-identical while giving Sphinx the single top-level section it needs.
+# Each value is (heading to demote, replacement); both must be one line long
+# so reported line numbers stay accurate.
+demoted_second_headings = {
+    "main/src/dpl/README": ("\n# Commands\n", "\n## Commands\n"),
+}
+
+
+def demote_second_heading(app, docname, source):
+    swap = demoted_second_headings.get(docname)
+    if swap is not None:
+        source[0] = source[0].replace(*swap)
+
+
 def setup(app):
     import os
+
+    app.connect("source-read", demote_second_heading)
 
     if not os.path.exists("./main"):
         os.symlink("..", "./main")
