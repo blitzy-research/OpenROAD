@@ -241,6 +241,45 @@ Rect Opendp::getBbox(odb::dbInst* inst)
 
   return Rect(loc_x, loc_y, loc_x + width, loc_y + height);
 }
+// Determinism foundation for the whole dpl module.  dbBlock::getInsts()
+// returns instances in OpenDB's internal storage order.  That order is an
+// implementation detail of the database, not a property of the design: it is
+// free to differ between builds, between platforms, and between two
+// databases that describe the same netlist.  Instance names are unique
+// within a block, so ordering on them makes the node sequence - and, since
+// Network::addNode numbers every node with its own index, each node id too -
+// a pure function of the design rather than of how the database happens to
+// be walked.
+//
+// What this fixes is the node sequence itself: the order the nodes are
+// inserted in, the ids they are given, and with them the order seen by every
+// consumer that walks network_->getNodes() and acts on what it finds without
+// reordering it.  prePlace() seeds cells sitting across a region edge,
+// setFixedGridCells() and setInitialGridCells() paint pixels,
+// checkPlacement() verifies cells under checks whose earlier verdicts change
+// what later ones see, and the displacement statistics and the write-back to
+// the database accumulate and report over them.  It does not reach every
+// later container, though - the cells of a fence region, for one, are
+// collected from that region's own instance list further down this file
+// rather than from network_.  stable_sort is used rather than sort for a
+// defensive reason: unique names cannot tie, but if they ever did the
+// incoming order would still decide.
+//
+// The sorted placement pass carries its own, independent guarantee and does
+// not rest on this one.  place() collects its candidates by walking
+// network_->getNodes() and then reorders them with std::ranges::sort under
+// CellPlaceOrderLess (Place.cpp), which is not a stable sort; what makes
+// that result reproducible is the comparator ending in a comparison of the
+// unique instance names, so no two cells ever compare equivalent and one
+// single arrangement is determined whatever order the candidates arrived
+// in.
+//
+// None of this is cosmetic.  OpenROAD is expected to reproduce results
+// bit-for-bit across compilers and operating systems, and wherever a pass
+// does commit cells in this order the order is the result: checkPixels()
+// refuses any site already claimed by an earlier cell, so a different
+// sequence lands them on different legal sites, with different
+// displacement, and hands different timing to every stage downstream.
 void Opendp::createNetwork()
 {
   odb::dbBlock* block = db_->getChip()->getBlock();

@@ -12,14 +12,39 @@ Open-Source Detailed Placement Engine. Its key features are:
 
 #### Diamond Search
 
-The default engine performs a BFS-style diamond search from each cell's
-global placement position, expanding outward in Manhattan order until a
-legal site is found.
+The default engine searches outward from each cell's global-placement
+position for the nearest legal site. The search is **best-first**, not
+breadth-first: candidate sites are held in a `std::priority_queue`
+min-heap keyed on the distance from the starting position rather than on a
+hop count, so the first legal site popped is the nearest legal site under
+that metric. That heap is ordered on Manhattan distance measured in
+**database units**, with the horizontal axis scaled by the site width and
+the vertical axis resolved through the row table, so rows of differing
+height are priced correctly and the two axes are not weighted equally: one
+row of vertical travel costs as much as several sites of horizontal travel.
+
+When no legal site is reachable within the displacement limits, the cell
+escalates to a bounded rip-up-and-replace: it unplaces the already-placed
+neighbours in a window around the target, retries the target, then runs a
+fresh search for each of the cells it evicted. Legalized positions are
+written back to the database before any failure is reported, so a failing
+run still updates the design. Detailed placement then reports how many
+instances it could not place (`DPL-0034`), lists them one instance per line
+(`DPL-0035`), saves violation markers, writes a JSON report when
+`-report_file_name` was given, and finally stops the run with an error
+(`DPL-0036`).
+
+The search, the exact distance it minimizes, the order cells are legalized
+in, the recovery path and the data structures behind them are documented
+[here](doc/LegalizationAlgorithm.md).
 
 #### NegotiationLegalizer
 
 An optional two-pass legalizer based on the NBLG paper. Enabled with
 `-use_negotiation` on the `detailed_placement` command.
+
+The figure below shows the pass structure of this optional engine only. It
+does not describe the default diamond-search engine.
 
 ```
 Global Placement result
@@ -47,8 +72,8 @@ Global Placement result
          ▼
 ┌───────────────────┐
 │ Post-optimisation │  Greedy displacement improvement (5 passes).
-│     (Skipped)     │  Cell swap via bipartite matching within groups.
-│                   │  
+│     (Skipped)     │  Pairwise swaps of same-type cells (equal height,
+│                   │  width, rail) when total displacement decreases.
 └────────┬──────────┘
          │
          ▼
@@ -226,7 +251,13 @@ Simply run the following script:
 
 ## Limitations
 
-The following limitations apply when using the NegotiationLegalizer (`-use_negotiation`):
+The limitations listed below are specific to the optional
+NegotiationLegalizer (`-use_negotiation`) and do not describe the default
+diamond-search engine. The default engine has its own limitations — among
+them a rip-up container whose iteration order depends on pointer values, a
+safety margin that shrinks the reachable search window, and routines the
+source itself marks as uncalled — which are documented in
+[Known Gotchas, Determinism, and Limitations](doc/LegalizationAlgorithm.md#known-gotchas-determinism-and-limitations).
 
 1. **Abacus cluster chain**: The current Abacus implementation uses a
    simplified cluster structure. A production version should maintain an
@@ -262,6 +293,7 @@ about this tool.
 2. P. Spindler et al., "Abacus: Fast legalization of standard cell circuits with minimal movement," ISPD 2008.
 3. J. Chen et al., "NBLG: A Robust Legalizer for Mixed-Cell-Height Modern Design," IEEE TCAD, vol. 41, no. 11, 2022.
 4. L. McMurchie and C. Ebeling, "PathFinder: A negotiation-based performance-driven router for FPGAs," 1995.
+5. Local reprint of reference 1, the OpenDP paper this module is based on. [(.pdf)](doc/OpenDP.pdf)
 
 ## License
 

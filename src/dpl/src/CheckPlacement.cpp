@@ -24,6 +24,89 @@ using utl::DPL;
 
 using utl::format_as;  // NOLINT(misc-unused-using-decls)
 
+// checkPlacement is this module's definition of "legal": a placement is
+// legal exactly when every check below passes for every cell, so the
+// ordered list that follows is the invariant detailed placement exists to
+// establish rather than a mere diagnostic pass.  It is also a standalone
+// verifier - importDb() rebuilds the network from the database and
+// adjustNodesOrient() re-reads each instance's orientation from it, so
+// nothing here trusts what this module last left in memory and a database
+// produced by any tool, or simply read from disk, can be checked.
+//
+// The nine separate failure vectors exist so that each class of violation
+// is reported under its own message identifier rather than collapsed into
+// a single unattributable error, and the mapping from check to identifier
+// is stable across runs.  The number alone is not unique module-wide,
+// though: four of the nine are shared with other messages in this module.
+// 5 and 6 also carry the informational lines detailed placement emits
+// earlier for the displacement limits and for the utilization report, both
+// in Opendp.cpp; there the level separates them, INFO against the warning
+// reportFailures() raises below.  3 and 4 also carry the warnings the Tcl
+// layer emits for the deprecated -disallow_one_site_gaps flag, on
+// detailed_placement and on check_placement respectively, in Opendp.tcl;
+// those are warnings as well, so only the message text separates them from
+// a violation.  The remaining five - 7, 8, 9, 10 and 11 - are used nowhere
+// else in the module.  initGrid() and groupAssignCellRegions() must run
+// before the loop because every per-cell test below but one reads either
+// the pixel grid or a cell's assigned region, and neither exists until
+// they do.  The placed check is that one exception: it reads the
+// instance's own status and depends on neither.
+//
+// The order inside the per-cell loop is forced, not incidental:
+//   - Site alignment comes first and is the only check that abandons the
+//     rest of the cell.  A left edge that is not a multiple of the site
+//     width, or a bottom edge that is not exactly some row's origin, puts
+//     the cell off the site/row lattice altogether, and the tests that
+//     convert the cell into grid indices derived from that lattice - the
+//     in-rows scan, region placement, and the pixel claiming the overlap
+//     pass performs - would then return verdicts that are meaningless
+//     rather than merely negative.  Not every later test is in that class:
+//     the placed test reads the instance's placement status straight from
+//     the database, and the overlap test compares cell rectangles in
+//     database units.  The effect of abandoning the cell is that a
+//     misaligned cell is reported under site alignment and under nothing
+//     else, and that its padding is never painted, so no later cell is
+//     measured against a reservation it would have made.
+//   - Site alignment, in-rows and region placement are gated on
+//     isStdCell() because all three are assertions about the row lattice,
+//     which only core and endcap instances are obliged to occupy.  What
+//     that gate lets past to the ungated checks is blocks: the network
+//     admits only masters OpenDB reports as core-auto-placeable, which
+//     covers the core, endcap and block families and excludes every pad
+//     variant outright, and this loop then skips any node not typed as a
+//     cell.  So no pad is ever among the cells checked here, and the
+//     ungated checks are being applied to blocks alongside standard
+//     cells.
+//   - The padding check deliberately precedes paintCellPadding(), so a
+//     cell is never rejected against its own reservation.  Reservations
+//     then accumulate as the loop advances, which suffices: a conflicting
+//     pair is caught when the later of the two cells is reached.
+//
+// The one-site-gap check is deferred to a second loop over every cell.
+// The explanation immediately above that loop is authoritative; the
+// mechanism behind it is that checkOverlap() carries a side effect - it
+// claims every unowned pixel it visits for the cell under test - while the
+// gap probe reads neighbouring pixels' cell pointers.  Only once the first
+// loop has run that side effect over every cell is the grid populated
+// enough for the probe to see a neighbour, so probing earlier would
+// silently under-report instead of failing.  Note also that the flag
+// guarding that loop is not a user setting: importDb() derives it from the
+// library, disallowing one-site gaps only when no master is exactly one
+// site wide, because a gap that narrow is a violation only when nothing
+// exists that could fill it.
+//
+// The reporting identifiers are fixed message numbers emitted in check
+// order, not in numeric order - 11 (Padding) is emitted between 5
+// (Overlap) and 6 (Site aligned) - so the sequence 3, 4, 5, 11, 6, 7, 8,
+// 9, 10 below is not a numbering scheme and must not be read as one:
+//   3 Placed, 4 Placed in rows, 5 Overlap, 11 Padding, 6 Site aligned,
+//   7 One site gap, 8 Region placement,
+//   9 LEF58_CELLEDGESPACINGTABLE, 10 Blocked layers.
+//
+// Observed characteristic: the design__violations metric sums five of the
+// nine categories, whereas the aggregation that raises the terminal error
+// sums all nine, one-site gaps conditionally.  A run can therefore publish
+// a zero violation count and still fail here.
 void Opendp::checkPlacement(const bool verbose,
                             const std::string& report_file_name)
 {
@@ -322,6 +405,32 @@ bool Opendp::isPlaced(const Node* cell)
   return cell->getDbInst()->isPlaced();
 }
 
+// "In rows" is a stronger claim than "inside the core area".  The core
+// rectangle is not guaranteed to be paved with sites: rows can be
+// fragmented or absent over parts of it, and the pixels standing in for
+// those places exist but are flagged invalid, so a cell can sit well
+// inside the core and still be in no row at all.  That is why the scan
+// rejects a present-but-invalid pixel as firmly as a missing one.
+//
+// The site-orientation query is applied only to the cell's first row
+// because that row is what fixes the cell's site and the orientation it
+// must take.  The query asks whether the row offers this cell's site at
+// that column at all, and in which orientation - ultimately a power-rail
+// question, since the supply rails run along a cell's top and bottom
+// edges, so the polarity a cell meets follows from the orientation of its
+// row.  Nothing here is deduced from a row's position in the stack: that
+// orientation is a property of the individual row, the grid records
+// whatever each database row declared alongside the span of sites it
+// declared it for, this query reads it back, and powerCompatible() consults
+// that row's own rail assignment - so neighbouring rows may agree or differ
+// and nothing here treats them as alternating.  A cell whose site is
+// unavailable there is not in that row however empty its pixels are.
+//
+// For a multi-row master the first row settles nothing on its own: the
+// cell spans several rows and must present compatible rail polarity to
+// each of them, which is why checkRowPowerCompatible is required across
+// the whole span.  A single-row master has no span to reconcile, so the
+// check is conditional rather than unconditional.
 bool Opendp::checkInRows(const Node& cell) const
 {
   const auto grid_rect = grid_->gridCovering(&cell);
@@ -388,6 +497,27 @@ bool Opendp::overlap(const Node* cell1, const Node* cell2) const
   return ll1.x < ur2.x && ur1.x > ll2.x && ll1.y < ur2.y && ur1.y > ll2.y;
 }
 
+// Only the West and East edges are probed; North and South return at once.
+// A one-site gap is a problem because it cannot be filled, and filler
+// cells are placed along rows, so only a horizontal gap is unfillable -
+// vertical clearance of a single row is not a gap in anything that gets
+// filled.  This mirrors the placement-time test in checkPixels, which
+// likewise looks left and right only.
+//
+// Abutment is tested first and the wider probe runs only when no abutting
+// cell was found: if a neighbour touches this edge there is no gap here to
+// measure, so looking past it would answer a question nobody asked.  The
+// wider probe sits two sites out from the cell's own boundary column - one
+// site for the gap itself, plus one more to reach the site where the next
+// cell would begin - which is why the offset is twice the unit step and
+// not the step itself.  The unit is sites, and its sign carries the
+// direction: negative to the West, positive to the East.
+//
+// The returned pointer names a cell found across such a gap.  The callback
+// keeps whatever the most recently probed edge yielded rather than
+// accumulating every offender, and its only caller consumes the result as
+// a presence test, so a violation is attributed to this cell without
+// recording which of its two sides produced it.
 Node* Opendp::checkOneSiteGaps(Node& cell) const
 {
   Node* gap_cell = nullptr;
@@ -420,6 +550,39 @@ Node* Opendp::checkOneSiteGaps(Node& cell) const
   return gap_cell;
 }
 
+// Both conditions are required and neither implies the other, and the two
+// carry different responsibilities.  contains() compares the cell's exact
+// database-unit rectangle against the single rectangle this cell was
+// assigned, so it is what refuses a cell protruding out of that rectangle
+// at all -- into open core or into anything else -- and it says nothing
+// about any other region.  The R-tree test inside checkRegionOverlap asks a
+// different question of a different set: it queries the index holding every
+// region rectangle in the design, demands exactly one hit, and demands that
+// the hit cover the box.  So what it adds is the refusal of a candidate
+// whose box reaches a second region rectangle, and a coverage test carried
+// out on other geometry -- a box rebuilt from grid indices, against
+// rectangles the index holds one database unit short on each upper edge.  A
+// cell can satisfy either test alone and still be illegally placed.
+//
+// The extents computed here are in database units, while the four
+// arguments handed to checkRegionOverlap are grid indices.  Observed
+// characteristic: the two Y indices are formed by dividing by the cell's own
+// height rather than by consulting the row table, so each is a count of that
+// height and lines up with Grid::gridYToDbu - the hybrid-row-aware
+// conversion checkRegionOverlap uses to turn them back into database
+// units - only where the quotient happens to land on the same recorded
+// boundary.  For a single-row cell in a design whose rows all share one
+// height, and whose stack starts at the core bottom, that holds throughout;
+// in a design mixing row heights it holds where the arithmetic coincides and
+// not otherwise; and for a multi-row cell, whose height spans several
+// boundaries, it generally does not hold at all.
+//
+// A cell with no region is legal here unconditionally, because region
+// placement constrains only cells that were assigned one.  The converse
+// direction, an unassigned cell intruding into somebody's region, is not
+// this function's concern: it is refused during placement by the
+// pixel-group conditions in checkPixels, which deny a pixel owned by a
+// group to any cell outside that group.
 bool Opendp::checkRegionPlacement(const Node* cell) const
 {
   const DbuX x_begin = cell->getLeft();

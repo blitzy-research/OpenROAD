@@ -113,6 +113,65 @@ Journal* Opendp::getJournal() const
   return journal_;
 }
 
+// Entry point for the detailed_placement command and the single point at
+// which the two legalization engines are chosen. Dispatch is on one flag
+// rather than two commands so that both engines share an identical
+// preamble - import, utilization screening, HPWL baseline and displacement
+// limit resolution all complete before the branch.
+//
+// What the two branches do after that differs, and the difference matters
+// to anything reading instance positions. Both close by gathering
+// displacement statistics and then calling updateDbInstLocations, but only
+// on the diamond branch does that leave the database holding
+// pre-legalization coordinates while the statistics are gathered. The
+// negotiation branch builds its own grid state first, and
+// NegotiationLegalizer::legalize writes cell positions and PLACED status
+// back through its own flushToDb before returning, so by the time this
+// function reaches findDisplacementStats on that path the database has
+// already been rewritten and the write-back below is a second pass over
+// positions the database has already seen.
+//
+// The displacement limits are all-or-nothing rather than per-axis. The
+// guard below tests max_displacement_x == 0 || max_displacement_y == 0, so
+// a caller passing a real X limit together with a zero Y limit does not
+// keep its X value: both arguments are discarded and both built-in
+// defaults are installed. Zero means unspecified for the pair as a whole.
+//
+// The two limits carry different units, and the DPL 5 message below is the
+// authoritative statement of which: the horizontal limit counts sites and
+// the vertical limit counts rows. The defaults are therefore 500 sites and
+// 100 rows. diamondSearch in Place.cpp applies the vertical limit to a row
+// index, so rows is the operative unit for it.
+//
+// The limits are resolved before any grid exists because Grid::initGrid
+// hands both of them to Grid::markHopeless, which uses them to classify
+// each site as a promising or unpromising place to start a search from.
+// That classification is consulted when a start point is picked - legalPt
+// diverts through moveHopeless when the chosen origin is flagged - and
+// never as a filter on candidate destinations, so a grid built from stale
+// limits would misjudge start points rather than hide legal sites.
+//
+// findDisplacementStats runs before updateDbInstLocations in both
+// branches. The displacement measure recovers each cell's start position
+// by reading the database instance (see disp below), so on the diamond
+// path that ordering is what keeps the start position readable: writing
+// legalized coordinates first would make every cell appear not to have
+// moved. It does not carry over to the negotiation branch:
+// NegotiationLegalizer::legalize writes instance locations itself through
+// flushToDb, both when a debug observer is attached and again as it
+// finishes, so by the time the statistics run there the database already
+// holds legalized coordinates.
+//
+// The diamond branch names every offending instance under DPL 34 and 35
+// and records them as database markers before raising DPL 36, so a failed
+// run tells the user which cells could not be legalized instead of only
+// that legalization failed. The marker capture always happens on this
+// path, but the JSON file does not: it is written only when the caller
+// asked for one by passing a non-empty report_file_name, so a run without
+// -report_file_name still names the cells and still fails, yet leaves no
+// artifact on disk. DPL 36 is an error rather than a warning: an
+// unlegalizable placement stops the flow instead of handing downstream
+// stages a database with overlapping cells.
 void Opendp::detailedPlacement(const int max_displacement_x,
                                const int max_displacement_y,
                                const std::string& report_file_name,
@@ -239,6 +298,25 @@ void Opendp::detailedPlacement(const int max_displacement_x,
   }
 }
 
+// Publishes legalized positions back to OpenDB. On the diamond-search path
+// this is the only writer of instance locations, which is what lets every
+// other routine here treat the database as still holding pre-legalization
+// state; disp and initialLocation both depend on that. The negotiation path
+// has a second, earlier writer: NegotiationLegalizer::flushToDb sets both
+// the placement status and the location of every movable instance from
+// inside legalize, so the pre-legalization reading holds only until that
+// runs.
+//
+// DPL works in core-relative coordinates so that grid indices and cell
+// offsets share one origin, so the core's lower-left corner has to be
+// added back on the way out: what a cell stores is an offset, not a chip
+// coordinate.
+//
+// Both writes are guarded by an inequality test, and the guard is not a
+// micro-optimization. Instance setters fire OpenDB callbacks, and those
+// callbacks propagate into the incremental state other tools keep about
+// this block, so rewriting an unchanged value would invalidate analysis
+// that nothing actually disturbed.
 void Opendp::updateDbInstLocations()
 {
   for (auto& cell : network_->getNodes()) {
@@ -259,6 +337,33 @@ void Opendp::updateDbInstLocations()
   }
 }
 
+// Reports the placement analysis table. DPL computes in database units, so
+// the printed table converts for the reader: total, average and maximum
+// displacement and both HPWL figures pass through block_->dbuToMicrons and
+// are therefore microns, while the delta HPWL line is a percentage.
+//
+// The published outputs do not share one unit, so a consumer that assumes
+// microns everywhere misreads two of them:
+//   - design__instance__displacement__total, __mean and __max are microns.
+//   - route__wirelength__estimated is microns.
+//   - dpl__hpwl__delta is the raw database-unit difference, unconverted.
+//   - dpl__hpwl__delta__percent is a unitless percentage of the baseline.
+//
+// dpl__hpwl__delta is the one quantity that leaves this routine in database
+// units: it publishes hpwl_legal - hpwl_before_ as measured, which is
+// neither the microns the table prints nor the rounded percentage that the
+// delta HPWL line and dpl__hpwl__delta__percent carry.
+//
+// The metric keys above are an observable output contract rather than an
+// internal detail: regression and reporting tooling outside this module
+// keys off their exact spelling and off the unit behind each one, so a
+// key's name and its unit are both part of the tool's behaviour however
+// that name happens to read.
+//
+// The percentage, and only the percentage, is guarded: its baseline is a
+// measured quantity and not a constant, so a design whose nets contribute
+// no wirelength leaves the pre-legalization baseline at zero and the
+// division would be by zero. The raw difference needs no such guard.
 void Opendp::reportLegalizationStats() const
 {
   logger_->report("Placement Analysis");
@@ -384,6 +489,26 @@ void Opendp::configureGlobalSwapParams(
   }
 }
 
+// How far one cell sits from where global placement left it, as Manhattan
+// distance in database units. The start position is not stored anywhere: it
+// is recovered by reading the database instance, so this measures
+// displacement from the global-placement position only for as long as no
+// database write has replaced it. On the diamond-search path the only such
+// write is updateDbInstLocations, which runs after the statistics. On the
+// negotiation path NegotiationLegalizer::flushToDb writes locations from
+// inside legalize, which is earlier, so what this measures there is
+// displacement from whatever that pass last wrote.
+//
+// The measure is deliberately unweighted: both axes are summed in raw
+// database units. It answers how far a cell physically moved, which is why
+// it is the right input for the reported displacement statistics and for
+// the displacement-ordered refinement sorts in Place.cpp.
+//
+// It is not the site-search metric. calcDist in Place.cpp measures a
+// different quantity from a different origin - distance from the current
+// search centre - and does weight the axes, scaling X by the site width
+// and resolving Y through the row table. Conflating the two would be
+// wrong: they agree on neither origin nor weighting.
 int Opendp::disp(const Node* cell) const
 {
   const DbuPt init = initialLocation(cell, false);
@@ -410,6 +535,28 @@ int Opendp::padRight(odb::dbInst* inst) const
   return padding_->padRight(inst).v;
 }
 
+// Builds the site grid. It is a thin forwarder rather than part of
+// diamondDPL because every DPL entry point that touches pixels needs the
+// same grid - legalization, placement checking, filler and decap placement
+// all route through here.
+//
+// The displacement limits are handed down because the start-point screening
+// is baked into the grid instead of being recomputed per search:
+// markHopeless uses them to flag the sites from which a search is treated as
+// unpromising, which legalPt reads when it picks an origin and moveHopeless
+// reads when it has to relocate one. They must therefore already be resolved
+// before this runs.
+//
+// Each call clears the six pixel fields the diamond legalizer reads - the
+// occupying cell, the owning fence group, the utilization accumulator, the
+// validity flag, the hopeless flag and the blocked-layer mask - so callers
+// are responsible for repainting whatever ownership they rely on
+// afterwards. Fixed cells, any already-legal cells and fence-region
+// ownership are all discarded here and restored by separate passes. It is
+// not a complete reinitialization of every pixel: where the grid vectors
+// have already been allocated, a padding reservation left by an earlier
+// pass and the negotiation engine's capacity, usage and history cost are
+// all carried over untouched.
 void Opendp::initGrid()
 {
   grid_->initGrid(
@@ -421,6 +568,21 @@ void Opendp::deleteGrid()
   grid_->clear();
 }
 
+// Answers which fence regions a box touches. The answer comes from an
+// R-tree because this sits on the innermost path of the site search: the
+// legality predicate consults checkRegionOverlap for every candidate site
+// it examines, so a linear scan over regions would cost the search a
+// factor of the region count. The tree is built once during database
+// import, by setUpPlacementGroups(), which runs after the separate
+// createNetwork() and createArchitecture() calls rather than as part of
+// either; here is the only place it is ever queried.
+//
+// The result vector belongs to the caller and is cleared on entry rather
+// than appended to, so the same storage can legitimately be handed back
+// for one query after another. The single caller does not take that
+// option: checkRegionOverlap declares a fresh vector on every invocation,
+// so in practice each query allocates. What the signature keeps is the
+// choice, and it keeps it on the caller's side rather than here.
 void Opendp::findOverlapInRtree(const bgBox& queryBox,
                                 std::vector<bgBox>& overlaps) const
 {
@@ -429,6 +591,26 @@ void Opendp::findOverlapInRtree(const bgBox& queryBox,
                        std::back_inserter(overlaps));
 }
 
+// Incremental-mode pass deciding which already-placed cells may keep the
+// positions they arrived with. It exists because incremental legalization
+// must not disturb work an earlier run already legalized, yet it cannot
+// take the incoming placement on trust either, so every placed cell has to
+// earn its position.
+//
+// The two screens below are independent and both are required: a cell can
+// sit exactly on a site and still overlap a neighbour, and a cell can be
+// entirely alone yet straddle a row boundary. Failing either disqualifies.
+//
+// The overlap screen borrows pixel->cell as scratch space to detect
+// collisions, which is why the sweep that follows clears every non-fixed
+// stamp before the final paint. Without that reset a disqualified cell
+// would leave its footprint behind and block sites the search is entitled
+// to use. Fixed stamps survive because an earlier pass painted them and
+// they are not what this pass is adjudicating.
+//
+// Both parties to a collision are disqualified rather than just the second
+// one encountered: nothing here justifies preferring either, and keeping
+// one would make the outcome depend on traversal order.
 void Opendp::setInitialGridCells()
 {
   std::unordered_set<Node*> conflicted;
@@ -501,6 +683,22 @@ void Opendp::setInitialGridCells()
   }
 }
 
+// Paints everything the legalizer is not allowed to move. This runs before
+// any search so that fixed obstructions already occupy their pixels when
+// the first candidate site is tested; the search has no notion of
+// fixedness and depends entirely on finding those pixels taken.
+//
+// Padding is recorded in its own pixel field instead of as occupancy. A
+// padding column is a real site that a compatible neighbour may still
+// legally use, so marking it occupied would sterilize usable area. The
+// DRC engine instead consults the reservation and decides whether one
+// specific cell conflicts with it.
+//
+// Masters that carry an overlap obstruction layer are painted from that
+// geometry rather than from their bounding box, so a notched or L-shaped
+// macro does not block sites it never covers. Blocks additionally get the
+// hopeless mark, which the recovery path reads as a cue to walk a cell off
+// the macro rather than as a statement about reachability.
 void Opendp::setFixedGridCells()
 {
   for (auto& cell : network_->getNodes()) {
@@ -526,6 +724,36 @@ void Opendp::setGridCell(Node& cell, Pixel* pixel)
   }
 }
 
+// Binds every cell of a fence region to one specific rectangle of that
+// region and records how full the region is.
+//
+// The binding has to be single-valued because its consumers dereference it
+// unconditionally: the group pre-placement passes in Place.cpp both sort
+// and aim by the bound rectangle, and the legality predicate's region
+// stage demands that the cell be covered by exactly one region box. That
+// is why a cell currently inside none of its region's rectangles is still
+// handed the first one instead of being left unbound - an arbitrary but
+// valid target beats a null pointer, and the search will carry the cell
+// inside.
+//
+// The utilization tally reads group ownership straight out of the pixels,
+// which ties what it measures to when those pixels were stamped, and the
+// two callers stand in different places on that. On the detailed-placement
+// path placeGroups() calls this after groupInitPixels() has painted region
+// ownership, so the tally sees real ownership. The verifier does not:
+// checkPlacement() calls this immediately after initGrid() and never runs
+// the group pixel initialization at all, so no pixel there carries a group
+// and every region's site area comes out zero. That costs the verifier
+// nothing, because it needs only the rectangle binding above, which reads
+// no pixels; the one consumer of the utilization figure is the group
+// placement pass in Place.cpp that chooses between the two
+// brick-placement strategies, and that runs on the other path only.
+//
+// Each row contributes its own height instead of a shared one, because rows
+// are not required to share a height: rowHeight(y) is read per row, so the
+// site area is right whether or not the design happens to have a single
+// pitch, and the tally never has to consult the grid's optional uniform
+// row height.
 void Opendp::groupAssignCellRegions()
 {
   const int64_t site_width = grid_->getSiteWidth().v;
@@ -562,6 +790,16 @@ void Opendp::groupAssignCellRegions()
   }
 }
 
+// Retires every site that straddles a fence-region boundary. A site only
+// partly inside a region cannot host a cell that must lie wholly within
+// it, and neither the search nor the legality predicate has any way to
+// express partial legality, so such sites leave consideration altogether.
+//
+// They are retired by parking the shared dummy cell on them rather than by
+// clearing a flag, because the legality predicate rejects outright any
+// pixel that already has an occupant. The dummy is constructed placed and
+// fixed, so no later pass tries to move it off. Invalidating the pixel as
+// well closes the same door from the other side.
 void Opendp::groupInitPixels2()
 {
   for (GridX x{0}; x < grid_->getRowSiteCount(); x++) {
@@ -651,6 +889,37 @@ bool Opendp::checkOverlap(const Rect& cell, const Rect& box)
          && box.yMin() < cell.yMax() && box.yMax() > cell.yMin();
 }
 
+// Establishes the pixel-level ownership that is one of three mechanisms
+// enforcing fence regions, and the only one that knows which group a site
+// belongs to. diamondSearch first clips its whole search window to the
+// group's merged bounding box, which for a region assembled from several
+// rectangles encloses whatever lies between them too, so that clamp
+// bounds the search rather than settling legality. checkRegionOverlap
+// then queries the region R-tree for each candidate, and that tree stores
+// bare rectangles with no group attached to them, so what it answers is
+// geometric coverage alone: a cell with a region must be covered by a
+// single region rectangle, which is what rejects one straddling two of
+// them, and a cell with none must overlap no region rectangle at all.
+// Which group a site belongs to is knowable only from the ownership
+// stamped here, and that is what the per-pixel scan reads: it rejects a
+// grouped cell whose pixel belongs to a different group, and rejects an
+// ungrouped cell on any group-owned pixel. Bounding box and R-tree both
+// work on whole rectangles, so without this stamp nothing would decide
+// legality site by site.
+//
+// The pass reuses pixel->util as a coverage accumulator, which is why it
+// begins by zeroing that field everywhere. A rectangle adds one unit to
+// each pixel it covers, and an edge that does not land on a site boundary
+// subtracts back the fraction of the site it leaves outside. For the
+// duration of this pass the field means how much of a site its region
+// covers, not the occupancy fraction it carries elsewhere.
+//
+// Classification needs a second sweep over the same rectangles because
+// accumulation has to finish first. A pixel shared by two rectangles of
+// one region still looks fractional until both have been added, and
+// classifying it early would retire a site the region fully covers. Only
+// exactly covered pixels take ownership; partly covered ones are retired
+// the same way boundary sites are.
 void Opendp::groupInitPixels()
 {
   for (GridX x{0}; x < grid_->getRowSiteCount(); x++) {
